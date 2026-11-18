@@ -94,8 +94,9 @@ installed at `/usr/local/lib/liivo/preview-forwarder.js`, `node:http` and
 WebSocket upgrade to `127.0.0.1:$PREVIEW_PORT`, answers 502 with a short page
 when nothing listens on the preview port, and is restarted by a loop in the
 entrypoint if it exits (backoff 1s doubling to 30s; exit code 2, a configuration
-error, is not retried). It is started with a clean environment (`PATH`, `HOME`,
-`PORT`, `PREVIEW_PORT` only), so it never sees tokens. It is not started when
+error, is not retried). It is started with a clean environment (`env -i` with
+`PATH`, `HOME`, `PORT`, `PREVIEW_PORT`, `PROJECT_DIR`, `LIIVO_INSTANCE` and
+`LIIVO_GATEWAY_URL`, none of them secret), so it never sees tokens. It is not started when
 `PORT` (default 8080) equals `PREVIEW_PORT`. The handoff key is the one value it
 needs that is secret: the entrypoint pipes it to the forwarder's stdin (the
 forwarder reads it once at start), so it is in no environment block.
@@ -133,6 +134,24 @@ HMAC-SHA256 under the 32 byte `HANDOFF_KEY` over the string `v1.<payload>`.
 random bytes in base64url. The signature is compared in constant time
 (`crypto.timingSafeEqual`). There is no lookup table: the key is derived per
 project by the gateway, so a token proves "signed for this project".
+
+**Requirements on the gateway** (this image relies on them):
+
+- The `HandoffKey` is derived per workspace (bound to the instance), never per
+  tenant and never global, and is standard base64 of exactly 32 bytes.
+- The token `host` is the bare lowercase hostname (no port, no scheme) that the
+  browser sends as `Host`.
+- The token `instance` equals the string this proxy uses in the redirect
+  `/w/<instance>` (the first label of the instance's public host).
+- Code running in the workspace can read its own key, so it can mint its own
+  `git` token. The gateway must therefore select the verification key by the
+  claimed `instance`, and must scope any GitHub token it returns to this
+  project's repository only.
+
+Defence in depth: once the workspace has learned its instance (from the first
+verified handoff or status token, kept in `$HOME/.liivo/identity.json`), a
+handoff or status token whose `instance` differs answers 401. The first
+handoff teaches it.
 
 **Without a valid session cookie:**
 
@@ -219,9 +238,11 @@ runs the real `osc-entrypoint.sh` against a stub `coder`) and
   instance options. Private repositories use the git credential helper above.
 - `HANDOFF_KEY` is removed from the environment of the Coder agent and of every
   process it starts, and reaches the forwarder only on stdin. It is still in the
-  environment block of the container's first process (PID 1, tini), which code
-  running as the same uid can read through `/proc/1/environ`, so this is hygiene
-  and not isolation either. What that code could do with the key it can already
+  original environment block of every process forked from the entrypoint's bash
+  (the forwarder restart-loop subshell and the hooks subshell), PID 1 (tini)
+  included: bash's `unset` does not rewrite the initial environ block that
+  `/proc/<pid>/environ` reads, and code running as the same uid can read it
+  there. So this is hygiene and not isolation either. What that code could do with the key it can already
   do (open its own workspace, ask for its own repository token); other
   workspaces use other keys, and members of the same tenant who can reveal
   service secrets can read the key (the OSC trust model for any instance).

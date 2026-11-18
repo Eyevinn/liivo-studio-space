@@ -148,6 +148,12 @@ function createForwarder({
       // none saved yet
     }
   }
+  // Once the identity has been learned from a verified token, a token naming
+  // another instance is refused (defence in depth: the key is per project).
+  // Before the first handoff nothing is known, so the first one teaches it.
+  function instanceMismatch(claims) {
+    return Boolean(identity.tenant) && claims.instance !== identity.instance;
+  }
   function learn(claims) {
     if (!claims.tenant || !claims.instance) return;
     if (identity.tenant === claims.tenant && identity.instance === claims.instance && (!claims.user || identity.user === claims.user)) return;
@@ -194,6 +200,7 @@ function createForwarder({
     if (!v.ok) return refuse();
     const host = String(req.headers.host || '').toLowerCase();
     if (!host || v.claims.host.toLowerCase() !== host) return refuse();
+    if (instanceMismatch(v.claims)) return refuse();
     if (!v.claims.nonce || !nonces.use(v.claims.nonce, v.claims.exp, t)) return refuse();
     learn(v.claims);
     res.writeHead(302, {
@@ -209,6 +216,9 @@ function createForwarder({
   async function status(req, res) {
     const v = auth.verifyToken(handoffKey, bearer(req), 'gateway', now());
     if (!v.ok) {
+      return text(res, 401, 'application/json', '{"error":"unauthorized"}\n', { 'WWW-Authenticate': 'Bearer' });
+    }
+    if (instanceMismatch(v.claims)) {
       return text(res, 401, 'application/json', '{"error":"unauthorized"}\n', { 'WWW-Authenticate': 'Bearer' });
     }
     learn(v.claims);

@@ -668,3 +668,30 @@ test('the git credential helper returns nothing and names the cause when the gat
   assert.strictEqual(r.code, 0);
   assert.match(r.stderr, /edit proxy not reachable/);
 });
+
+test('once the instance is learned, a handoff or status token naming another instance answers 401; the first handoff teaches it', async () => {
+  const file = path.join(tmp, 'identity-pin.json');
+  const pinned = createForwarder({ previewPort: 1, handoffKey: KEY, gatewayUrl: GATEWAY, instance: 'guess', projectDir: tmp, identityFile: file, now });
+  const port = await listen(pinned);
+  const hand = (t) => request(port, { path: `/?__liivo=${t}` });
+  const stat = (t) => request(port, { path: '/__liivo/status', headers: { Authorization: `Bearer ${t}` } });
+  try {
+    // nothing learned yet: the first valid handoff is accepted whatever it names
+    assert.strictEqual((await hand(browserToken({ instance: 'tenant-first' }))).status, 302);
+    assert.strictEqual((await hand(browserToken({ instance: 'tenant-other' }))).status, 401);
+    assert.strictEqual((await hand(browserToken({ instance: '' }))).status, 401);
+    assert.strictEqual((await stat(gatewayToken({ instance: 'tenant-other' }))).status, 401);
+    assert.strictEqual((await hand(browserToken({ instance: 'tenant-first' }))).status, 302);
+    assert.strictEqual((await stat(gatewayToken({ instance: 'tenant-first' }))).status, 200);
+  } finally {
+    pinned.close();
+  }
+  // a restart remembers it from the identity file
+  const again = createForwarder({ previewPort: 1, handoffKey: KEY, gatewayUrl: GATEWAY, projectDir: tmp, identityFile: file, now });
+  const port2 = await listen(again);
+  try {
+    assert.strictEqual((await request(port2, { path: `/?__liivo=${browserToken({ instance: 'tenant-other' })}` })).status, 401);
+  } finally {
+    again.close();
+  }
+});
