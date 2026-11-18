@@ -112,9 +112,45 @@ run_hooks() {
 if [ -d "$PROJECT_DIR" ]; then
   (
     unset CODER_AGENT_TOKEN CODER_AGENT_URL CODER_AGENT_AUTH
+    # Project processes bind to loopback: the forwarder below is the only
+    # listener on a non-loopback address (contract in docs/block.md).
+    export HOST=127.0.0.1
     run_hooks
   ) < /dev/null > "$HOME/liivo-run.log" 2>&1 &
 fi
+
+# Preview forwarder on PORT: forwards to 127.0.0.1:$PREVIEW_PORT. Restarted by
+# the loop if it exits. It needs neither agent variable.
+FORWARDER=/usr/local/lib/liivo/preview-forwarder.js
+# The orchestrator does not set PORT: the instance's container port is fixed at 8080.
+PORT="${PORT:-8080}"
+if [ "$PORT" = "$PREVIEW_PORT" ]; then
+  log "WARNING: PORT equals PREVIEW_PORT ($PORT), preview forwarder not started"
+elif [ ! -f "$FORWARDER" ]; then
+  log "WARNING: $FORWARDER not found, preview forwarder not started"
+else
+  (
+    # Clean environment: the forwarder never inherits tokens or other secrets.
+    delay=1
+    while true; do
+      rc=0
+      env -i PATH="$PATH" HOME="$HOME" PORT="$PORT" PREVIEW_PORT="$PREVIEW_PORT" node "$FORWARDER" || rc=$?
+      if [ "$rc" -eq 2 ]; then
+        echo "osc-entrypoint: preview forwarder has a configuration error (exit 2), not restarting" >&2
+        break
+      fi
+      echo "osc-entrypoint: preview forwarder exited ($rc), restarting in ${delay}s" >&2
+      sleep "$delay"
+      delay=$((delay * 2))
+      [ "$delay" -le 30 ] || delay=30
+    done
+  ) < /dev/null &
+  log "preview forwarder on port $PORT -> 127.0.0.1:$PREVIEW_PORT"
+fi
+
+# No Docker engine in the instance: switch off the agent's devcontainer
+# detection, which otherwise loops on "docker: command not found".
+export CODER_AGENT_DEVCONTAINERS_ENABLE=false
 
 log "starting coder agent against $CODER_AGENT_URL"
 cd "$PROJECT_DIR" 2>/dev/null || cd "$HOME"

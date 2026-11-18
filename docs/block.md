@@ -36,8 +36,11 @@ from the instance description.
 
 ## Variables set by the platform
 
-`PORT`, `OSC_HOSTNAME` and `OSC_ENV` are set by the orchestrator. The entrypoint
-uses `OSC_HOSTNAME` for `LIIVO_EDIT_URL`.
+The orchestrator injects `OSC_HOSTNAME` only (osaas-lib-orchestrator
+`containers.ts`, `k8s.ts`). It does not set `PORT`: the main container port is
+fixed at 8080 (`name: http`) and the Service targets it. The image therefore sets
+`ENV PORT=8080` and the entrypoint defaults `PORT` to 8080. The entrypoint uses
+`OSC_HOSTNAME` for `LIIVO_EDIT_URL`.
 
 ## Order values to choose at import
 
@@ -60,11 +63,46 @@ uses `OSC_HOSTNAME` for `LIIVO_EDIT_URL`.
   restarted without a persistent volume, the checkout is cloned again from git on
   the next start, so uncommitted work is lost. Commit and push.
 - The preview is served on the instance's own OSC hostname
-  (`<name>.<serviceId>.auto.<env>.osaas.io`). Nothing in this repo listens on
-  `PORT` yet: the Liivo edit proxy is expected to be started by the Coder agent
-  (a template script) or baked into the image later. Whether the orchestrator
+  (`<name>.<serviceId>.auto.<env>.osaas.io`) by the preview forwarder (see
+  "Preview forwarder and loopback contract" below). Whether the orchestrator
   needs a listener on `PORT` for the instance to count as ready is unverified.
 - Credentials arrive only as environment variables from OSC secrets.
+
+## Preview forwarder and loopback contract
+
+`osc-entrypoint.sh` starts a small forwarder (`forwarder/preview-forwarder.js`,
+installed at `/usr/local/lib/liivo/preview-forwarder.js`, `node:http` and
+`node:net` only) on `0.0.0.0:$PORT`. It forwards every HTTP request and
+WebSocket upgrade to `127.0.0.1:$PREVIEW_PORT`, answers 502 with a short page
+when nothing listens on the preview port, and is restarted by a loop in the
+entrypoint if it exits (backoff 1s doubling to 30s; exit code 2, a configuration
+error, is not retried). It is started with a clean environment (`PATH`, `HOME`,
+`PORT`, `PREVIEW_PORT` only), so it never sees tokens. It is not started when
+`PORT` (default 8080) equals `PREVIEW_PORT`.
+
+The forwarder passes `Host` and any `X-Forwarded-*` headers through unchanged.
+The preview app must not trust them, and the preview is not an authentication
+boundary: the W2 edit proxy is the tenant boundary.
+
+- `GET /__liivo/open` answers 302 to `/` (the gateway links here so the browser
+  passes the OSC gate on a gated path before an SPA's root loads).
+- Every other path under `/__liivo/` is reserved and answers 404.
+
+**Contract for a project's dev server:** bind to `127.0.0.1:$PREVIEW_PORT`, not
+to `0.0.0.0`. The entrypoint exports `HOST=127.0.0.1` for `.liivo/setup.sh` and
+`.liivo/start.sh`, which many tools honour. Flags for common servers:
+
+- Vite: `vite --host 127.0.0.1 --port "$PREVIEW_PORT"`
+- Next.js: `next dev -H 127.0.0.1 -p "$PREVIEW_PORT"`
+
+The forwarder must be the only listener on a non-loopback address in the
+instance. Check with `ss -ltn` (or `/proc/net/tcp`).
+
+The entrypoint also sets `CODER_AGENT_DEVCONTAINERS_ENABLE=false`: the instance
+has no Docker engine, and the agent's devcontainer detection otherwise logs
+`docker: command not found` in a loop.
+
+Tests: `node --test 'forwarder/*.test.js'`.
 
 ## Security notes
 
