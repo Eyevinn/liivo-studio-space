@@ -1,0 +1,108 @@
+#!/bin/bash
+# OSC entrypoint for the Liivo Studio workspace block.
+# Maps OSC option variables to what the workspace needs, prepares the project
+# checkout, then runs the Coder agent. Secret values are never printed.
+set -eu
+
+log() { echo "osc-entrypoint: $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# The agent cannot start without these. They are instance options (the token is
+# a service secret), so a missing value means the instance was created wrong.
+[ -n "${CODER_AGENT_URL:-}" ] || die "CODER_AGENT_URL is required (instance option AgentUrl: the public URL of the Coder instance)"
+[ -n "${CODER_AGENT_TOKEN:-}" ] || die "CODER_AGENT_TOKEN is required (instance option AgentToken: the Coder agent token, normally a {{secrets.x}} reference)"
+
+HOME="${HOME:-/home/coder}"
+export HOME
+PROJECT_DIR="${PROJECT_DIR:-$HOME/project}"
+PREVIEW_PORT="${PREVIEW_PORT:-3000}"
+case "$PREVIEW_PORT" in
+  ''|*[!0-9]*) die "PREVIEW_PORT must be a number, got '$PREVIEW_PORT'" ;;
+esac
+[ "$PREVIEW_PORT" -ge 1 ] && [ "$PREVIEW_PORT" -le 65535 ] || die "PREVIEW_PORT out of range: $PREVIEW_PORT"
+
+# Token auth for the agent, and the variables Liivo tooling in the project reads.
+export CODER_AGENT_AUTH="${CODER_AGENT_AUTH:-token}"
+export LIIVO_REPO_DIR="$PROJECT_DIR"
+export LIIVO_PREVIEW_PORT="$PREVIEW_PORT"
+if [ -n "${OSC_HOSTNAME:-}" ]; then
+  export LIIVO_EDIT_URL="https://${OSC_HOSTNAME}"
+fi
+
+# Claude Code through the Studio LLM proxy. Not wired yet: only set when the
+# instance gets both options. The proxy token is not a Claude credential.
+if [ -n "${PROXY_URL:-}" ] && [ -n "${PROXY_TOKEN:-}" ]; then
+  export ANTHROPIC_BASE_URL="$PROXY_URL"
+  export ANTHROPIC_AUTH_TOKEN="$PROXY_TOKEN"
+fi
+
+# The home directory may be an empty volume: seed it from the image once.
+[ -w "$HOME" ] || die "$HOME is not writable by uid $(id -u)"
+if [ ! -f "$HOME/.liivo-seeded" ] && [ -d /opt/home-skel ]; then
+  cp -a --update=none /opt/home-skel/. "$HOME/"
+  touch "$HOME/.liivo-seeded"
+fi
+mkdir -p "$HOME/.liivo"
+
+# Never show credentials that may be embedded in a git URL.
+mask_url() { echo "$1" | sed -E 's#(://)[^/@]*@#\1***@#'; }
+
+# Project checkout: clone on first start, leave it alone afterwards. A failed
+# clone does not stop the agent, so the workspace stays reachable for debugging.
+if [ -n "${REPO_URL:-}" ]; then
+  case "$REPO_URL" in
+    -*) die "REPO_URL must not start with '-'" ;;
+  esac
+  if [ -d "$PROJECT_DIR/.git" ]; then
+    log "project already checked out in $PROJECT_DIR"
+  elif [ -e "$PROJECT_DIR" ] && [ -n "$(ls -A "$PROJECT_DIR" 2>/dev/null)" ]; then
+    log "WARNING: $PROJECT_DIR exists and is not a git checkout, skipping clone"
+  else
+    log "cloning $(mask_url "$REPO_URL") into $PROJECT_DIR"
+    if git clone -- "$REPO_URL" "$PROJECT_DIR" > "$HOME/liivo-clone.log" 2>&1; then
+      if [ -n "${REPO_BRANCH:-}" ]; then
+        (cd "$PROJECT_DIR" && { git checkout "$REPO_BRANCH" 2>/dev/null || git checkout -b "$REPO_BRANCH"; }) \
+          || log "WARNING: could not switch to branch $REPO_BRANCH"
+      fi
+      touch "$HOME/.liivo/project-cloned"
+    else
+      log "WARNING: git clone failed, see $HOME/liivo-clone.log (agent starts anyway)"
+    fi
+  fi
+else
+  mkdir -p "$PROJECT_DIR"
+  log "REPO_URL not set, empty project directory $PROJECT_DIR"
+fi
+
+# Project hooks run in the background so the workspace is usable at once.
+# They do not get the agent credentials. setup.sh runs once (marker file),
+# start.sh on every start.
+run_hooks() {
+  cd "$PROJECT_DIR" || exit 0
+  if command -v mise >/dev/null 2>&1; then
+    mise trust -a >/dev/null 2>&1 || true
+    mise install >/dev/null 2>&1 || true
+  fi
+  if [ -f .liivo/setup.sh ] && [ ! -f "$HOME/.liivo/setup.done" ]; then
+    echo "running .liivo/setup.sh"
+    if bash .liivo/setup.sh; then
+      touch "$HOME/.liivo/setup.done"
+    else
+      echo "setup.sh failed, it runs again on the next start"
+    fi
+  fi
+  if [ -f .liivo/start.sh ]; then
+    echo "running .liivo/start.sh"
+    bash .liivo/start.sh || echo "start.sh exited with an error"
+  fi
+}
+if [ -d "$PROJECT_DIR" ]; then
+  (
+    unset CODER_AGENT_TOKEN CODER_AGENT_URL CODER_AGENT_AUTH
+    run_hooks
+  ) < /dev/null > "$HOME/liivo-run.log" 2>&1 &
+fi
+
+log "starting coder agent against $CODER_AGENT_URL"
+cd "$PROJECT_DIR" 2>/dev/null || cd "$HOME"
+exec coder agent

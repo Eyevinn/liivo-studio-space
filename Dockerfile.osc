@@ -1,0 +1,45 @@
+# OSC build of the Liivo Studio workspace: one instance per project workspace,
+# running the Coder agent (not the Coder server).
+#
+# Differences from liivo-studio/images/workspace/Dockerfile: no Docker engine and
+# no sudo (OSC instances run unprivileged), and the `coder` binary is bundled from
+# the pinned official image so it matches the server (the `coder-coder` block runs
+# the same tag) and needs no download through the OSC login gate.
+
+# Keep this tag equal to the tag in eyevinn-osaas/coder Dockerfile.osc.
+FROM ghcr.io/coder/coder:v2.38.10 AS coder
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git openssh-client jq ripgrep unzip less vim \
+      build-essential python3 iproute2 procps tini \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=coder --chmod=755 /opt/coder /usr/local/bin/coder
+
+# Non-root user, uid 1000. No sudo and no extra groups.
+RUN userdel -r ubuntu 2>/dev/null || true \
+ && useradd -m -s /bin/bash -u 1000 coder
+
+# mise: per-project runtime versions (node, python, go, ...) from the repo's
+# .tool-versions / mise.toml / package.json engines.
+ARG MISE_VERSION=v2026.11.9
+RUN curl -fsSL https://mise.run | MISE_VERSION=${MISE_VERSION} MISE_INSTALL_PATH=/usr/local/bin/mise sh
+ENV MISE_DATA_DIR=/home/coder/.local/share/mise \
+    PATH=/home/coder/.local/share/mise/shims:/home/coder/.local/bin:$PATH
+
+USER coder
+WORKDIR /home/coder
+# A default Node so Claude Code and JS projects work before any project setup.
+RUN mise use -g node@22 && npm i -g corepack && corepack enable \
+ && curl -fsSL https://claude.ai/install.sh | bash
+
+# Image copy of home, restored into an empty home volume on first start.
+USER root
+RUN cp -a /home/coder /opt/home-skel
+COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
+
+USER 1000:1000
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/osc-entrypoint.sh"]
