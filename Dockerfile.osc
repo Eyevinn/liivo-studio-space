@@ -40,9 +40,14 @@ RUN mise use -g node@22 && npm i -g corepack && corepack enable \
 USER root
 RUN cp -a /home/coder /opt/home-skel
 COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
-# Preview forwarder on PORT (node:http and node:net only). Uses the default Node
-# from mise, which the entrypoint has on PATH.
-COPY --chmod=644 forwarder/preview-forwarder.js /usr/local/lib/liivo/preview-forwarder.js
+# Edit proxy and preview forwarder on PORT (node:* modules only), with its token
+# module, the git status reader and the git credential helper. Every file the
+# forwarder requires must be listed here. Uses the default Node from mise, which
+# the entrypoint has on PATH.
+COPY --chmod=644 forwarder/preview-forwarder.js forwarder/auth.js forwarder/workspace-status.js forwarder/git-credential-liivo.js /usr/local/lib/liivo/
+# Git credentials for github.com come from the gateway through the edit proxy;
+# the helper prints nothing (git goes unauthenticated) when that fails.
+RUN git config --system 'credential.https://github.com.helper' '!node /usr/local/lib/liivo/git-credential-liivo.js'
 
 USER 1000:1000
 # The orchestrator does not set PORT; the container port is fixed at 8080.

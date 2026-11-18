@@ -5,6 +5,10 @@ const http = require('node:http');
 const net = require('node:net');
 const crypto = require('node:crypto');
 const { createForwarder } = require('./preview-forwarder.js');
+const auth = require('./auth.js');
+
+const KEY = crypto.randomBytes(32);
+const COOKIE = `${auth.COOKIE_NAME}=${auth.signSession(KEY, { tenant: 't', user: 'u', instance: 't-p' }, Math.floor(Date.now() / 1000))}`;
 
 const sockets = new Set();
 
@@ -18,7 +22,7 @@ function listen(server) {
 
 function request(port, { method = 'GET', path = '/', headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, method, path, headers, agent: false }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port, method, path, headers: { Cookie: COOKIE, ...headers }, agent: false }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
@@ -65,14 +69,14 @@ before(async () => {
     socket.on('data', (d) => socket.write(d.toString().toUpperCase()));
   });
   upstreamPort = await listen(upstream);
-  fwd = createForwarder({ previewPort: upstreamPort });
+  fwd = createForwarder({ previewPort: upstreamPort, handoffKey: KEY });
   fwdPort = await listen(fwd);
 
   // A port that nothing listens on.
   const tmp = net.createServer();
   const deadPort = await listen(tmp);
   await new Promise((r) => tmp.close(r));
-  deadFwd = createForwarder({ previewPort: deadPort });
+  deadFwd = createForwarder({ previewPort: deadPort, handoffKey: KEY });
   deadFwdPort = await listen(deadFwd);
 });
 
@@ -109,7 +113,7 @@ test('forwards a WebSocket upgrade and relays bytes both ways', async () => {
     socket.on('error', reject);
     socket.on('connect', () => {
       socket.write(
-        `GET /ws?token=1 HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`
+        `GET /ws?token=1 HTTP/1.1\r\nHost: x\r\nCookie: ${COOKIE}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`
       );
     });
     socket.on('data', (d) => {
@@ -142,7 +146,7 @@ test('answers 502 on a WebSocket upgrade with no upstream', async () => {
     let buf = '';
     socket.on('error', reject);
     socket.on('connect', () =>
-      socket.write('GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n')
+      socket.write(`GET /ws HTTP/1.1\r\nHost: x\r\nCookie: ${COOKIE}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n`)
     );
     socket.on('data', (d) => (buf += d.toString()));
     socket.on('close', () => resolve(buf));
@@ -158,7 +162,8 @@ test('GET /__liivo/open answers 302 to /', async () => {
   }
 });
 
-function raw(port, text) {
+function raw(port, text, withSession = true) {
+  if (withSession) text = text.replace('\r\n', `\r\nCookie: ${COOKIE}\r\n`);
   return new Promise((resolve, reject) => {
     const socket = net.connect(port, '127.0.0.1');
     let buf = '';
@@ -171,11 +176,11 @@ function raw(port, text) {
 
 test('absolute-form, encoded, cased and dot-segment targets hit the reserved namespace', async () => {
   const targets = [
-    'http://x/__liivo/status',
-    'http://x/__LIIVO/status',
-    '/%5f%5fliivo/status',
-    '//__liivo/status',
-    '/a/../__liivo/status',
+    'http://x/__liivo/other',
+    'http://x/__LIIVO/other',
+    '/%5f%5fliivo/other',
+    '//__liivo/other',
+    '/a/../__liivo/other',
     '/__liivo',
   ];
   for (const t of targets) {
@@ -189,13 +194,13 @@ test('absolute-form, encoded, cased and dot-segment targets hit the reserved nam
 test('a WebSocket upgrade on a /__liivo/ path answers 404 and is not forwarded', async () => {
   const out = await raw(
     fwdPort,
-    'GET /__liivo/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n'
+    `GET /__liivo/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n`
   );
   assert.match(out, /^HTTP\/1\.1 404 /);
 });
 
 test('other /__liivo/ paths are reserved and answer 404, never forwarded', async () => {
-  for (const path of ['/__liivo/status', '/__liivo/', '/__liivo/open/x']) {
+  for (const path of ['/__liivo/other', '/__liivo/', '/__liivo/open/x']) {
     const res = await request(fwdPort, { path });
     assert.strictEqual(res.status, 404, path);
   }

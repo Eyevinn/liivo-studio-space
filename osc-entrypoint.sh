@@ -29,12 +29,37 @@ if [ -n "${OSC_HOSTNAME:-}" ]; then
   export LIIVO_EDIT_URL="https://${OSC_HOSTNAME}"
 fi
 
-# Claude Code through the Studio LLM proxy. Not wired yet: only set when the
-# instance gets both options. The proxy token is not a Claude credential.
-if [ -n "${PROXY_URL:-}" ] && [ -n "${PROXY_TOKEN:-}" ]; then
-  export ANTHROPIC_BASE_URL="$PROXY_URL"
-  export ANTHROPIC_AUTH_TOKEN="$PROXY_TOKEN"
+# Claude Code reads its credential from its own environment. The platform passes
+# the tenant's credential as the options ClaudeCodeOauthToken and AnthropicApiKey
+# (the Agent Tasks mechanism). The credential type the tenant does not have
+# arrives as the literal "unset" (or empty). Never print either value. Code
+# running in the workspace can read them (docs/block.md).
+for claude_var in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; do
+  claude_val="${!claude_var:-}"
+  if [ -n "$claude_val" ] && [ "$claude_val" != "unset" ]; then
+    export "${claude_var?}"
+  else
+    unset "$claude_var"
+  fi
+done
+unset claude_var claude_val
+
+# Edit proxy key (option HandoffKey): base64 of 32 bytes, read here once and
+# unset, so the coder agent and everything it starts never inherit it. It
+# reaches the edit proxy on stdin only (see below). A missing or malformed key
+# is not fatal: the proxy then refuses every request with 503 (fail closed).
+handoff_key="${HANDOFF_KEY:-}"
+unset HANDOFF_KEY
+if [ -z "$handoff_key" ]; then
+  log "WARNING: HANDOFF_KEY is not set (option HandoffKey): the edit proxy answers 503 to every request until the project is recreated"
+elif [ "$(printf '%s' "$handoff_key" | base64 -d 2>/dev/null | wc -c | tr -d ' ')" != "32" ]; then
+  log "WARNING: HANDOFF_KEY is not 32 bytes of base64: the edit proxy answers 503 to every request until the project is recreated"
+  handoff_key=""
 fi
+# The instance name is the first label of the public host. Only used for the
+# redirect to the gateway before any handoff has told the proxy better.
+osc_host="${OSC_HOSTNAME:-}"
+LIIVO_INSTANCE="${osc_host%%.*}"
 
 # The home directory may be an empty volume: seed it from the image once.
 [ -w "$HOME" ] || die "$HOME is not writable by uid $(id -u)"
@@ -47,6 +72,42 @@ if [ ! -f "$HOME/.liivo-seeded" ] && [ -d /opt/home-skel ]; then
   touch "$HOME/.liivo-seeded"
 fi
 mkdir -p "$HOME/.liivo"
+chmod 700 "$HOME/.liivo" 2>/dev/null || true
+
+# Edit proxy and preview forwarder on PORT. It is the tenant boundary: every
+# request needs its own session (docs/block.md). It forwards to
+# 127.0.0.1:$PREVIEW_PORT and is restarted by the loop if it exits. It starts
+# before the clone so the git credential helper can reach its signing socket.
+# It gets a clean environment (no tokens) and the handoff key on stdin, so the
+# key is in no environment block that project processes could inherit.
+FORWARDER=/usr/local/lib/liivo/preview-forwarder.js
+# The orchestrator does not set PORT: the instance's container port is fixed at 8080.
+PORT="${PORT:-8080}"
+if [ "$PORT" = "$PREVIEW_PORT" ]; then
+  log "WARNING: PORT equals PREVIEW_PORT ($PORT), preview forwarder not started"
+elif [ ! -f "$FORWARDER" ]; then
+  log "WARNING: $FORWARDER not found, preview forwarder not started"
+else
+  (
+    delay=1
+    while true; do
+      rc=0
+      printf '%s' "$handoff_key" | env -i PATH="$PATH" HOME="$HOME" PORT="$PORT" PREVIEW_PORT="$PREVIEW_PORT" \
+        PROJECT_DIR="$PROJECT_DIR" LIIVO_INSTANCE="$LIIVO_INSTANCE" LIIVO_GATEWAY_URL="${LIIVO_GATEWAY_URL:-}" \
+        node "$FORWARDER" || rc=$?
+      if [ "$rc" -eq 2 ]; then
+        echo "osc-entrypoint: preview forwarder has a configuration error (exit 2), not restarting" >&2
+        break
+      fi
+      echo "osc-entrypoint: preview forwarder exited ($rc), restarting in ${delay}s" >&2
+      sleep "$delay"
+      delay=$((delay * 2))
+      [ "$delay" -le 30 ] || delay=30
+    done
+  ) < /dev/null &
+  log "preview forwarder on port $PORT -> 127.0.0.1:$PREVIEW_PORT"
+fi
+unset handoff_key
 
 # Never show credentials that may be embedded in a git URL. The userinfo part
 # ends at the LAST '@' before the first '/' after the scheme, so a password that
@@ -111,41 +172,12 @@ run_hooks() {
 }
 if [ -d "$PROJECT_DIR" ]; then
   (
-    unset CODER_AGENT_TOKEN CODER_AGENT_URL CODER_AGENT_AUTH
-    # Project processes bind to loopback: the forwarder below is the only
+    unset CODER_AGENT_TOKEN CODER_AGENT_URL CODER_AGENT_AUTH CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY
+    # Project processes bind to loopback: the edit proxy is the only
     # listener on a non-loopback address (contract in docs/block.md).
     export HOST=127.0.0.1
     run_hooks
   ) < /dev/null > "$HOME/liivo-run.log" 2>&1 &
-fi
-
-# Preview forwarder on PORT: forwards to 127.0.0.1:$PREVIEW_PORT. Restarted by
-# the loop if it exits. It needs neither agent variable.
-FORWARDER=/usr/local/lib/liivo/preview-forwarder.js
-# The orchestrator does not set PORT: the instance's container port is fixed at 8080.
-PORT="${PORT:-8080}"
-if [ "$PORT" = "$PREVIEW_PORT" ]; then
-  log "WARNING: PORT equals PREVIEW_PORT ($PORT), preview forwarder not started"
-elif [ ! -f "$FORWARDER" ]; then
-  log "WARNING: $FORWARDER not found, preview forwarder not started"
-else
-  (
-    # Clean environment: the forwarder never inherits tokens or other secrets.
-    delay=1
-    while true; do
-      rc=0
-      env -i PATH="$PATH" HOME="$HOME" PORT="$PORT" PREVIEW_PORT="$PREVIEW_PORT" node "$FORWARDER" || rc=$?
-      if [ "$rc" -eq 2 ]; then
-        echo "osc-entrypoint: preview forwarder has a configuration error (exit 2), not restarting" >&2
-        break
-      fi
-      echo "osc-entrypoint: preview forwarder exited ($rc), restarting in ${delay}s" >&2
-      sleep "$delay"
-      delay=$((delay * 2))
-      [ "$delay" -le 30 ] || delay=30
-    done
-  ) < /dev/null &
-  log "preview forwarder on port $PORT -> 127.0.0.1:$PREVIEW_PORT"
 fi
 
 # No Docker engine in the instance: switch off the agent's devcontainer
