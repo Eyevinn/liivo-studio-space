@@ -40,6 +40,9 @@ RUN mise use -g node@22 && npm i -g corepack && corepack enable \
 USER root
 RUN cp -a /home/coder /opt/home-skel
 COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
+# Preview forwarder on PORT (node:http and node:net only). Uses the default Node
+# from mise, which the entrypoint has on PATH.
+COPY --chmod=644 forwarder/preview-forwarder.js /usr/local/lib/liivo/preview-forwarder.js
 
 USER 1000:1000
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/osc-entrypoint.sh"]
