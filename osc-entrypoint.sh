@@ -39,7 +39,11 @@ fi
 # The home directory may be an empty volume: seed it from the image once.
 [ -w "$HOME" ] || die "$HOME is not writable by uid $(id -u)"
 if [ ! -f "$HOME/.liivo-seeded" ] && [ -d /opt/home-skel ]; then
-  cp -a --update=none /opt/home-skel/. "$HOME/"
+  # Copy the skeleton's children, not "/opt/home-skel/.": cp -a on "." tries to set the timestamps
+  # and mode of the mounted volume root, which a non-owner cannot do (EPERM, the instance crash-loops).
+  shopt -s dotglob nullglob
+  cp -a --update=none /opt/home-skel/* "$HOME/"
+  shopt -u dotglob nullglob
   touch "$HOME/.liivo-seeded"
 fi
 mkdir -p "$HOME/.liivo"
