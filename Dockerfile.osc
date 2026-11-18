@@ -45,4 +45,6 @@ COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
 COPY --chmod=644 forwarder/preview-forwarder.js /usr/local/lib/liivo/preview-forwarder.js
 
 USER 1000:1000
+# The orchestrator does not set PORT; the container port is fixed at 8080.
+ENV PORT=8080
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/osc-entrypoint.sh"]

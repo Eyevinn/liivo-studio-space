@@ -13,13 +13,30 @@ const PAGE_502 =
   '<!doctype html><html><head><meta charset="utf-8"><title>Preview not running</title></head>' +
   "<body><h1>Preview not running</h1><p>The project's preview is not running.</p></body></html>\n";
 
+// Normalised path of a request target, for the /__liivo/ checks only (the
+// forwarded target is never rewritten). Handles absolute-form targets
+// (`GET http://x/__liivo/..`), dot segments, percent-encoding, repeated slashes
+// and case.
 function pathOf(url) {
-  const i = url.search(/[?#]/);
-  return i === -1 ? url : url.slice(0, i);
+  let p;
+  try {
+    // Leading slashes are collapsed first: `//host/p` would otherwise parse as
+    // a protocol-relative URL and hide the path.
+    p = new URL(url.replace(/^\/{2,}/, '/'), 'http://x').pathname;
+  } catch {
+    p = url;
+  }
+  try {
+    p = decodeURIComponent(p);
+  } catch {
+    // keep the undecoded path
+  }
+  return p.replace(/\/{2,}/g, '/').toLowerCase();
 }
 
 function isReserved(url) {
-  return pathOf(url).startsWith(RESERVED_PREFIX);
+  const p = pathOf(url);
+  return p === '/__liivo' || p.startsWith(RESERVED_PREFIX);
 }
 
 function createForwarder({ previewPort, upstreamHost = '127.0.0.1' }) {
@@ -74,8 +91,12 @@ function createForwarder({ previewPort, upstreamHost = '127.0.0.1' }) {
       return;
     }
     const upstream = net.connect(previewPort, upstreamHost);
+    let established = false;
     upstream.on('error', () => {
-      if (socket.writable) {
+      // Never write a 502 page into a stream that is already past the handshake.
+      if (established) {
+        socket.destroy();
+      } else if (socket.writable) {
         socket.end(
           'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/html; charset=utf-8\r\n' +
             `Content-Length: ${Buffer.byteLength(PAGE_502)}\r\n\r\n${PAGE_502}`
@@ -85,6 +106,7 @@ function createForwarder({ previewPort, upstreamHost = '127.0.0.1' }) {
       }
     });
     upstream.on('connect', () => {
+      established = true;
       let rawHead = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
       for (let i = 0; i < req.rawHeaders.length; i += 2) {
         rawHead += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
@@ -94,8 +116,11 @@ function createForwarder({ previewPort, upstreamHost = '127.0.0.1' }) {
       socket.pipe(upstream);
       upstream.pipe(socket);
     });
-    upstream.on('close', () => socket.destroy());
-    socket.on('close', () => upstream.destroy());
+    // Half-close first so data still in flight is flushed, then destroy.
+    upstream.on('end', () => socket.end());
+    socket.on('end', () => upstream.end());
+    upstream.on('close', () => setTimeout(() => socket.destroy(), 1000).unref());
+    socket.on('close', () => setTimeout(() => upstream.destroy(), 1000).unref());
   });
 
   server.on('clientError', (err, socket) => {

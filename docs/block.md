@@ -36,8 +36,11 @@ from the instance description.
 
 ## Variables set by the platform
 
-`PORT`, `OSC_HOSTNAME` and `OSC_ENV` are set by the orchestrator. The entrypoint
-uses `OSC_HOSTNAME` for `LIIVO_EDIT_URL`.
+The orchestrator injects `OSC_HOSTNAME` only (osaas-lib-orchestrator
+`containers.ts`, `k8s.ts`). It does not set `PORT`: the main container port is
+fixed at 8080 (`name: http`) and the Service targets it. The image therefore sets
+`ENV PORT=8080` and the entrypoint defaults `PORT` to 8080. The entrypoint uses
+`OSC_HOSTNAME` for `LIIVO_EDIT_URL`.
 
 ## Order values to choose at import
 
@@ -72,8 +75,14 @@ installed at `/usr/local/lib/liivo/preview-forwarder.js`, `node:http` and
 `node:net` only) on `0.0.0.0:$PORT`. It forwards every HTTP request and
 WebSocket upgrade to `127.0.0.1:$PREVIEW_PORT`, answers 502 with a short page
 when nothing listens on the preview port, and is restarted by a loop in the
-entrypoint if it exits. It is not started when `PORT` is unset or equals
-`PREVIEW_PORT`.
+entrypoint if it exits (backoff 1s doubling to 30s; exit code 2, a configuration
+error, is not retried). It is started with a clean environment (`PATH`, `HOME`,
+`PORT`, `PREVIEW_PORT` only), so it never sees tokens. It is not started when
+`PORT` (default 8080) equals `PREVIEW_PORT`.
+
+The forwarder passes `Host` and any `X-Forwarded-*` headers through unchanged.
+The preview app must not trust them, and the preview is not an authentication
+boundary: the W2 edit proxy is the tenant boundary.
 
 - `GET /__liivo/open` answers 302 to `/` (the gateway links here so the browser
   passes the OSC gate on a gated path before an SPA's root loads).

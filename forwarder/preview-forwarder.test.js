@@ -158,6 +158,42 @@ test('GET /__liivo/open answers 302 to /', async () => {
   }
 });
 
+function raw(port, text) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1');
+    let buf = '';
+    socket.on('error', reject);
+    socket.on('connect', () => socket.write(text));
+    socket.on('data', (d) => (buf += d.toString()));
+    socket.on('close', () => resolve(buf));
+  });
+}
+
+test('absolute-form, encoded, cased and dot-segment targets hit the reserved namespace', async () => {
+  const targets = [
+    'http://x/__liivo/status',
+    'http://x/__LIIVO/status',
+    '/%5f%5fliivo/status',
+    '//__liivo/status',
+    '/a/../__liivo/status',
+    '/__liivo',
+  ];
+  for (const t of targets) {
+    const out = await raw(fwdPort, `GET ${t} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`);
+    assert.match(out, /^HTTP\/1\.1 404 /, t);
+  }
+  const open = await raw(fwdPort, 'GET http://x/__liivo/open HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+  assert.match(open, /^HTTP\/1\.1 302 /);
+});
+
+test('a WebSocket upgrade on a /__liivo/ path answers 404 and is not forwarded', async () => {
+  const out = await raw(
+    fwdPort,
+    'GET /__liivo/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n'
+  );
+  assert.match(out, /^HTTP\/1\.1 404 /);
+});
+
 test('other /__liivo/ paths are reserved and answer 404, never forwarded', async () => {
   for (const path of ['/__liivo/status', '/__liivo/', '/__liivo/open/x']) {
     const res = await request(fwdPort, { path });

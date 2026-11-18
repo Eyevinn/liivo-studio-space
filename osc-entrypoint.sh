@@ -122,20 +122,27 @@ fi
 # Preview forwarder on PORT: forwards to 127.0.0.1:$PREVIEW_PORT. Restarted by
 # the loop if it exits. It needs neither agent variable.
 FORWARDER=/usr/local/lib/liivo/preview-forwarder.js
-if [ -z "${PORT:-}" ]; then
-  log "WARNING: PORT is not set, preview forwarder not started"
-elif [ "$PORT" = "$PREVIEW_PORT" ]; then
+# The orchestrator does not set PORT: the instance's container port is fixed at 8080.
+PORT="${PORT:-8080}"
+if [ "$PORT" = "$PREVIEW_PORT" ]; then
   log "WARNING: PORT equals PREVIEW_PORT ($PORT), preview forwarder not started"
 elif [ ! -f "$FORWARDER" ]; then
   log "WARNING: $FORWARDER not found, preview forwarder not started"
 else
   (
-    unset CODER_AGENT_TOKEN CODER_AGENT_URL CODER_AGENT_AUTH
-    export PORT PREVIEW_PORT
+    # Clean environment: the forwarder never inherits tokens or other secrets.
+    delay=1
     while true; do
-      node "$FORWARDER" || true
-      echo "osc-entrypoint: preview forwarder exited, restarting in 1s" >&2
-      sleep 1
+      rc=0
+      env -i PATH="$PATH" HOME="$HOME" PORT="$PORT" PREVIEW_PORT="$PREVIEW_PORT" node "$FORWARDER" || rc=$?
+      if [ "$rc" -eq 2 ]; then
+        echo "osc-entrypoint: preview forwarder has a configuration error (exit 2), not restarting" >&2
+        break
+      fi
+      echo "osc-entrypoint: preview forwarder exited ($rc), restarting in ${delay}s" >&2
+      sleep "$delay"
+      delay=$((delay * 2))
+      [ "$delay" -le 30 ] || delay=30
     done
   ) < /dev/null &
   log "preview forwarder on port $PORT -> 127.0.0.1:$PREVIEW_PORT"
