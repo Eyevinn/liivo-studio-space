@@ -64,6 +64,22 @@ uses `OSC_HOSTNAME` for `LIIVO_EDIT_URL`.
   `PORT` yet: the Liivo edit proxy is expected to be started by the Coder agent
   (a template script) or baked into the image later. Whether the orchestrator
   needs a listener on `PORT` for the instance to count as ready is unverified.
-- Credentials arrive only as environment variables from OSC secrets. The
-  entrypoint removes the Coder agent variables from the environment of
-  `.liivo/setup.sh` and `.liivo/start.sh`.
+- Credentials arrive only as environment variables from OSC secrets.
+
+## Security notes
+
+- The entrypoint removes `CODER_AGENT_TOKEN`, `CODER_AGENT_URL` and
+  `CODER_AGENT_AUTH` from the environment of `.liivo/setup.sh` and
+  `.liivo/start.sh`, so the hooks do not inherit them. This is hygiene, not
+  isolation: the hooks run as the same uid (1000) as the Coder agent, so a hook
+  can read the agent's `/proc/<pid>/environ` and get the token. The image has no
+  sudo and runs as uid 1000, so the entrypoint cannot run the hooks as another
+  uid. The token only grants access to this one workspace's agent endpoints, and
+  the hooks are the workspace owner's own repo code. Writing the token to a file
+  would not help, since the same uid can read it too.
+- Do not embed credentials in `RepoUrl`. The entrypoint masks the userinfo part
+  when it logs the URL, but the full URL is still passed to `git clone`, stored
+  in the checkout's `.git/config` as the `origin` remote and visible in the
+  instance options. Private repositories should use a git credential helper or
+  `GIT_ASKPASS` instead; that is not implemented yet and is left to a later
+  change.
