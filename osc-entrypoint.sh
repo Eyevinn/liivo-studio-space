@@ -44,8 +44,11 @@ if [ ! -f "$HOME/.liivo-seeded" ] && [ -d /opt/home-skel ]; then
 fi
 mkdir -p "$HOME/.liivo"
 
-# Never show credentials that may be embedded in a git URL.
-mask_url() { echo "$1" | sed -E 's#(://)[^/@]*@#\1***@#'; }
+# Never show credentials that may be embedded in a git URL. The userinfo part
+# ends at the LAST '@' before the first '/' after the scheme, so a password that
+# itself contains '@' is masked completely. URLs without a scheme (scp-style
+# git@host:o/r.git) are left as they are.
+mask_url() { echo "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/]*@#\1***@#'; }
 
 # Project checkout: clone on first start, leave it alone afterwards. A failed
 # clone does not stop the agent, so the workspace stays reachable for debugging.
@@ -75,8 +78,14 @@ else
 fi
 
 # Project hooks run in the background so the workspace is usable at once.
-# They do not get the agent credentials. setup.sh runs once (marker file),
-# start.sh on every start.
+# setup.sh runs once (marker file), start.sh on every start.
+# Isolation limit: the unset below only keeps the agent variables out of the
+# hooks' own environment (they are not inherited or printed by accident). It is
+# not a security boundary. The hooks run as the same uid as the agent, so a hook
+# can still read the agent's /proc/<pid>/environ. The entrypoint runs as uid 1000
+# without sudo and cannot drop to another uid. The token only grants access to
+# this one workspace's agent endpoints, and the hooks are the workspace owner's
+# own repo code.
 run_hooks() {
   cd "$PROJECT_DIR" || exit 0
   if command -v mise >/dev/null 2>&1; then
