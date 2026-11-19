@@ -105,6 +105,9 @@ write_bridge_state() {
   mv -f "$tmp" "$BRIDGE_DIR/state.json"
 }
 write_bridge_state starting
+# A reload request recorded before this start (by the forwarder, for the bridge of an earlier run) is never acted on.
+RELOAD_REQUEST="$BRIDGE_DIR/reload-request"
+rm -f "$RELOAD_REQUEST"
 
 # Edit proxy and preview forwarder on PORT. It is the tenant boundary: every
 # request needs its own session (docs/block.md). It forwards to
@@ -154,14 +157,36 @@ unset handoff_key
 # CODER_AGENT_*) or of the other secrets. A gateway failure backs off 5, 10, 20, 40, then 60 s; the
 # bridge restarts after 1 to 30 s. The tenant's project code runs as the same uid and can reach the
 # bridge's files and loopback port; docs/block.md says so.
+# Reload (POST /__liivo/bridge/reload, recorded by the forwarder as $RELOAD_REQUEST, only its existence is read):
+# while the bridge runs the supervisor polls once a second, reads the bridge's loopback /health itself and stops
+# the bridge it started (SIGTERM, never a pid from a file) only on a 200 answer with boolean busy=false. Any other
+# answer keeps the request; a request older than RELOAD_MAX_AGE seconds is deleted without acting. A stop for a
+# reload is not a crash (run_delay untouched) and the fetcher runs again so the gateway's current version starts.
+RELOAD_MAX_AGE=300
+bridge_idle() {
+  local body
+  # No answer (curl fails, or says nothing) is never idle. jq -e alone would exit 0 on empty input.
+  body="$(curl -fsS -m 2 "http://127.0.0.1:$BRIDGE_PORT/health" 2> /dev/null)" || return 1
+  [ -n "$body" ] || return 1
+  printf '%s' "$body" | jq -e '(.busy | type) == "boolean" and .busy == false' > /dev/null 2>&1
+}
+reload_expired() {
+  local mtime
+  mtime="$(stat -c %Y "$RELOAD_REQUEST" 2> /dev/null)" || return 1
+  [ $(($(date +%s) - mtime)) -gt "$RELOAD_MAX_AGE" ]
+}
 supervise_bridge() {
-  local gw_delay=5 run_delay=1 rc version started bpid
+  local gw_delay=5 run_delay=1 rc version started bpid reloaded
   local -a bridge_env
+  # A fifo nothing writes to: `read -t 1` on it is a one second wait that is not a `sleep` call.
+  mkfifo "$BRIDGE_DIR/.tick" && exec 9<> "$BRIDGE_DIR/.tick" && rm -f "$BRIDGE_DIR/.tick"
   while true; do
     rc=0
     # env -i: the fetcher needs only PATH (node, tar) and HOME (the signer socket and the cache); it gets
     # none of the agent's or the Claude credential's variables.
     version="$(env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" node "$FETCHER")" || rc=$?
+    # A request recorded while the fetch ran is satisfied by it.
+    rm -f "$RELOAD_REQUEST"
     case "$version" in
       '' | *[!A-Za-z0-9._-]*) [ "$rc" -ne 0 ] || rc=3 ;;
     esac
@@ -193,13 +218,36 @@ supervise_bridge() {
       write_bridge_state running "$version"
       printf '{"version":"%s","pid":%s,"startedAt":"%s"}\n' "$version" "$bpid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BRIDGE_DIR/running.json"
       rc=0
+      reloaded=""
+      while kill -0 "$bpid" 2> /dev/null; do
+        if [ -e "$RELOAD_REQUEST" ]; then
+          if reload_expired; then
+            rm -f "$RELOAD_REQUEST"
+            log "bridge reload request expired without an idle bridge, deleted"
+          elif bridge_idle; then
+            kill -TERM "$bpid" 2> /dev/null && reloaded=1
+            rm -f "$RELOAD_REQUEST"
+            break
+          fi
+        fi
+        read -r -t 1 -u 9 _ || true
+      done
       wait "$bpid" || rc=$?
       write_bridge_state starting "$version"
+      if [ -n "$reloaded" ]; then
+        log "bridge stopped for a reload ($rc), fetching the current bridge"
+        break
+      fi
       [ $(($(date +%s) - started)) -lt 60 ] || run_delay=1
       log "bridge exited ($rc), restarting in ${run_delay}s"
       sleep "$run_delay"
       run_delay=$((run_delay * 2))
       [ "$run_delay" -le 30 ] || run_delay=30
+      if [ -e "$RELOAD_REQUEST" ]; then
+        rm -f "$RELOAD_REQUEST"
+        log "bridge reload requested while the bridge was down, fetching the current bridge"
+        break
+      fi
     done
   done
 }
