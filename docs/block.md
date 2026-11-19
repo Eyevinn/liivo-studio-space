@@ -233,15 +233,36 @@ as the directory holds a checkout or any file; a failed attempt removes only wha
 created (the directory it made, or the files it put into the empty directory it
 found). Every attempt is logged in `~/liivo-clone.log` with its time and in the
 entrypoint log with its cause (the tenant is not known yet, authentication failed,
-repository not found, invalid URL). A permanent failure is retried the same way, so
-the log says why. The URL is masked in the log. When the clone succeeds,
+repository not found, invalid URL, timed out). The cause is read from that
+attempt's own output, so an attempt that names no cause says "see
+`~/liivo-clone.log`" and never repeats an earlier attempt's cause. A permanent
+failure is retried the same way, so the log says why. The URL is masked in the
+log.
+
+Every attempt, the first one and each retry, runs under a time limit of 120 s. A git
+that does not stop at the limit is killed 10 s later. An attempt stopped this way
+counts as a failed attempt: `~/liivo-clone.log` records that it timed out after N s,
+the entrypoint log gives "timed out after Ns" as its cause, and the retry goes on
+as usual. The first attempt runs before the agent starts, so a hung first attempt
+delays the agent by at most the limit plus the 10 s. The hooks start no later than
+the retry budget, plus one steady delay (60 s), plus the limit, plus the 10 s after
+the first failure. A failed attempt that git ended by the time limit or by a signal
+owns what it left, so it also removes a partial `.git` from the empty directory. An
+attempt that exited by itself and left a `.git/HEAD` leaves the directory alone,
+because that can be a checkout made by hand; the retry then ends with "no longer
+empty, not cloning". A clone that needs more than the limit never finishes through
+the retry, because git starts from zero on every attempt; clone it by hand in that
+case. When the clone succeeds,
 `~/.liivo/project-cloned` is written. `.liivo/setup.sh` and `.liivo/start.sh` run
 after the clone succeeded or the budget is spent, never against an empty directory
 while a retry is pending; the agent and the edit proxy start at once and do not
 wait. If the repository is still unreachable after the budget, restart the
 workspace or run `git clone` or `git pull` by hand. The delays and budget can be
 changed with `LIIVO_CLONE_RETRY_DELAYS`, `LIIVO_CLONE_RETRY_STEADY` and
-`LIIVO_CLONE_RETRY_BUDGET` (seconds; used by the tests).
+`LIIVO_CLONE_RETRY_BUDGET` (seconds; used by the tests). The time limit is
+`LIIVO_CLONE_TIMEOUT` (default 120) and the grace before the kill is
+`LIIVO_CLONE_KILL_GRACE` (default 10), both in seconds. They are variables of the
+entrypoint, not options in the maker order.
 
 **Bridge token.** The same socket answers `POST /bridge-token` with an `aud`
 `bridge` token that lives 45 s (the browser tokens' slack for clock skew) and the
