@@ -111,11 +111,15 @@ removed from the `Cookie` header; other cookies pass).
   links here so the browser passes the OSC gate on a gated path before an SPA's
   root loads).
 - `GET /__liivo/status` is the status endpoint (see below).
+- `POST /__liivo/bridge/reload` is the bridge reload (see "Bridge reload" below). It is the one
+  exception to the 404 for `/__liivo/bridge/*`: it is handled before the session check, like
+  `/__liivo/status`, so a browser, a page on the previewed origin and any request without a
+  valid `aud` `gateway` token get 401.
 - `GET` and `HEAD` requests and WebSocket upgrades under `/__liivo/` (the chat,
   its script and its WebSocket) go to the bridge on `127.0.0.1:4777`, after the
   session check (see "The bridge" below). Any other method answers 405 and is not
   forwarded.
-- `/__liivo/bridge/*`, `/__liivo/open/x`, `/__liivo/status/x`, `/__liivo/` and any
+- Every other `/__liivo/bridge/*` path, `/__liivo/open/x`, `/__liivo/status/x`, `/__liivo/` and any
   target that is not already in plain form (percent-encoded, dot segments, a
   doubled slash, absolute-form, another letter case) are reserved and answer 404
   (with a session), whatever the bridge does.
@@ -306,6 +310,50 @@ gateway image carries it as one tarball whose version is the gateway's build.
   else: no `HANDOFF_KEY`, no `CODER_AGENT_*`, no other secret. `state.json` (state and
   version) and `running.json` (version, pid, start time) are written in
   `~/.liivo/bridge/`; `/__liivo/status` reports the state.
+- **Bridge reload.** `POST /__liivo/bridge/reload` with `Authorization: Bearer <token
+  aud=gateway>` (same token, instance check and `learn` as `/__liivo/status`; any other
+  method with a valid token answers 405 `Allow: POST`; a WebSocket upgrade to the path is
+  not answered by the route). It is honoured only when the bridge is idle (no Claude turn
+  running and no pending permission request, which is `busy === false`):
+  - The forwarder reads `GET http://127.0.0.1:4777/health` once (deadline 2 s, under the
+    gateway's 5 s abort). 200 JSON with boolean `busy === false` is honoured: it writes the
+    request file `~/.liivo/bridge/reload-request` (mode 0600, atomic rename, only its
+    existence is read) and answers `202 {"reload":"started"}` at once, never waiting for the
+    stop or the fetch. `busy === true` answers `409 {"reload":"refused","reason":"busy"}`.
+    A 200 without a boolean `busy`, a non-200, a body that is not JSON, a request file
+    that cannot be written: `409 {"reload":"refused","reason":"unknown"}`. A refusal
+    changes nothing (no file, no signal, no fetch). 2xx means "recorded", not "the supervisor
+    is alive"; the gateway (Eyevinn/liivo-studio#48) reads the status class only.
+  - No answer from the bridge at all (refused, timeout) follows `state.json`: `starting`
+    (the bridge exited, the supervisor will restart the cached one) is honoured, `running` (a
+    live process that does not answer may be mid-turn) and `unavailable` are refused with
+    reason `unknown`.
+  - The supervisor polls once a second while the bridge runs. With a request present it reads
+    the same `/health` itself (curl and jq, 2 s) right before it signals and sends SIGTERM to the
+    bridge it started (never a pid from a file) only on a 200 JSON answer with boolean
+    `busy === false`. Anything else (busy, no answer, non-200, malformed) keeps the request and
+    touches nothing. The stop is not a crash: the 1 to 30 s restart wait and its doubling are
+    untouched, no "restarting in" log. The fetcher then runs again so `current` points at the
+    gateway's current version and that bridge starts (`state.json` is `starting` meanwhile, then
+    `running` with the new version). A fetch that fails falls back as it always does (the newest
+    verified cached bridge, or none and the 5 to 60 s backoff with state `unavailable`).
+  - A request that exists when the supervisor leaves its restart wait after an exit makes the
+    next step a fetch instead of a restart of the cached bridge. A request written during a fetch is
+    satisfied by that fetch. No `/health` read is made when no bridge runs.
+  - The entrypoint deletes any request file left on the volume before the supervisor starts. A
+    request that the supervisor keeps (busy bridge) is deleted without acting once it is
+    older than 300 s (`RELOAD_MAX_AGE` in `osc-entrypoint.sh`), so a request recorded during a long
+    turn cannot reload the bridge at a much later idle moment; the gateway asks again at a
+    later open (its own throttle, 10 minutes).
+  - **What an idle read cannot see.** The interval between the supervisor's last read and the
+    delivery of the signal; the bridge's change operations, which run with `busy` false (the
+    commit and push after each turn, "Skicka in" and "Släng"), which is the typical case
+    for a kept request's first idle read; and `refreshRepos` (its `update.sh` hook and `startRepo`).
+    A SIGTERM cuts each of them. The drain that closes this lives in the bridge: Eyevinn/liivo-studio
+    "Bridge: on SIGTERM wait for the work in flight (running turn, change operation, refreshRepos)
+    before exiting" (#52), not here.
+  - The same uid can write the request file, but it can only start a reload of a bridge that the
+    supervisor reads as idle, which that code could already cause by killing the bridge.
 - **`.liivo/start.sh`.** The entrypoint runs it as the leader of its own process
   group and writes its id to `/tmp/liivo-start-<project dir name>.pid`, which is how
   the bridge stops and restarts it after it moved the checkout to newer code.
