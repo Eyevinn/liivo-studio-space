@@ -118,6 +118,8 @@ rm -f "$RELOAD_REQUEST"
 LIB_DIR="${LIIVO_LIB_DIR:-/usr/local/lib/liivo}"
 FORWARDER="$LIB_DIR/preview-forwarder.js"
 FETCHER="$LIB_DIR/bridge-fetch.js"
+# The default start for a repository without .liivo/start.sh (see run_hooks).
+DEFAULT_START="$LIB_DIR/default-start.js"
 forwarder_started=""
 # The orchestrator does not set PORT: the instance's container port is fixed at 8080.
 PORT="${PORT:-8080}"
@@ -208,7 +210,7 @@ supervise_bridge() {
       LIIVO_REPO_DIR="$PROJECT_DIR" LIIVO_PREVIEW_PORT="$PREVIEW_PORT"
       LIIVO_GATEWAY_URL="${LIIVO_GATEWAY_URL:-}" LIIVO_INSTANCE="$LIIVO_INSTANCE"
       OSC_HOSTNAME="${OSC_HOSTNAME:-}" LIIVO_PREVIEW_URL="${LIIVO_EDIT_URL:-}"
-      LIIVO_BRIDGE_PORT="$BRIDGE_PORT" DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1)
+      LIIVO_BRIDGE_PORT="$BRIDGE_PORT" LIIVO_DEFAULT_START="$DEFAULT_START" DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1)
     [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || bridge_env+=(CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
     [ -z "${ANTHROPIC_API_KEY:-}" ] || bridge_env+=(ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
     while true; do
@@ -432,6 +434,20 @@ run_hooks() {
       bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "$start_pid_file" bash .liivo/start.sh \
         || echo "start.sh exited with an error"
     fi
+  elif [ -f "$DEFAULT_START" ]; then
+    # No own start.sh: the default start derives install and start from package.json and the lockfile
+    # (docs/block.md). Same wrapper and pid file as an own start.sh, so the bridge's restart contract holds
+    # from the first moment; its output goes to /tmp/liivo-start-<dir>.log, the file the bridge appends to.
+    start_name="liivo-start-$(basename "$PROJECT_DIR")"
+    echo "running the default start, output in /tmp/$start_name.log"
+    # shellcheck disable=SC2016 # $$ and $1 are for the inner bash, not this one
+    if command -v setsid >/dev/null 2>&1; then
+      setsid --wait bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "/tmp/$start_name.pid" node "$DEFAULT_START" \
+        >> "/tmp/$start_name.log" 2>&1 || echo "the default start ended with an error"
+    else
+      bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "/tmp/$start_name.pid" node "$DEFAULT_START" \
+        >> "/tmp/$start_name.log" 2>&1 || echo "the default start ended with an error"
+    fi
   fi
 }
 start_hooks() {
@@ -444,6 +460,8 @@ start_hooks() {
     run_hooks
   ) < /dev/null > "$HOME/liivo-run.log" 2>&1
 }
+# A state left in /tmp by an earlier run of the default start is never shown.
+rm -f "/tmp/liivo-start-$(basename "$PROJECT_DIR").state"
 if [ -n "$clone_retry" ]; then
   # The first clone failed: the hooks wait for the retries (until the clone works or the budget is
   # spent), so a hook never runs against an empty directory. The agent below does not wait.
