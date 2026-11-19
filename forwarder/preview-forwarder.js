@@ -16,6 +16,7 @@ const path = require('node:path');
 const auth = require('./auth.js');
 const { workspaceStatus } = require('./workspace-status.js');
 const inject = require('./inject.js');
+const { defaultStartStatus } = require('./default-start-status.js');
 
 const RESERVED_PREFIX = '/__liivo/';
 const OPEN_PATH = '/__liivo/open';
@@ -41,9 +42,15 @@ const PAGE_401 =
   '<!doctype html><html><head><meta charset="utf-8"><title>Sign in required</title></head>' +
   '<body><h1>Sign in required</h1><p>Open this project from Liivo Studio.</p></body></html>\n';
 
-const PAGE_502 =
-  '<!doctype html><html><head><meta charset="utf-8"><title>Preview not running</title></head>' +
-  `<body><h1>Preview not running</h1><p>The project's preview is not running.</p>${inject.tagFor('')}</body></html>\n`;
+// The page for a preview that does not answer. With a status of the default start (default-start.js) it adds one
+// status line and, while the default start is installing or starting, reloads itself.
+function page502(status = null) {
+  const refresh = status && status.refresh ? '<meta http-equiv="refresh" content="4">' : '';
+  return (
+    `<!doctype html><html><head><meta charset="utf-8">${refresh}<title>Preview not running</title></head>` +
+    `<body><h1>Preview not running</h1><p>The project's preview is not running.</p>${status ? status.html : ''}${inject.tagFor('')}</body></html>\n`
+  );
+}
 
 // Normalised path of a request target, for the /__liivo/ checks only (the
 // forwarded target is never rewritten). Handles absolute-form targets
@@ -170,6 +177,8 @@ function createForwarder({
   gatewayUrl = '',
   instance = '',
   projectDir = '',
+  // Where default-start.js writes its state file (/tmp in the workspace; a test points it elsewhere).
+  startStateDir = '/tmp',
   identityFile = '',
   bridgePort = DEFAULT_BRIDGE_PORT,
   bridgeStateFile = '',
@@ -471,11 +480,12 @@ function createForwarder({
         res.destroy();
         return;
       }
+      const page = page502(defaultStartStatus(projectDir, startStateDir));
       res.writeHead(502, {
         'Content-Type': 'text/html; charset=utf-8',
-        'Content-Length': Buffer.byteLength(PAGE_502),
+        'Content-Length': Buffer.byteLength(page),
       });
-      res.end(PAGE_502);
+      res.end(page);
     });
     res.on('close', () => upstream.destroy());
     req.pipe(upstream);
@@ -547,9 +557,10 @@ function createForwarder({
       } else if (toBridge && socket.writable) {
         socket.end(`HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\nRetry-After: 2\r\n\r\n`);
       } else if (socket.writable) {
+        const page = page502(defaultStartStatus(projectDir, startStateDir));
         socket.end(
           'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/html; charset=utf-8\r\n' +
-            `Content-Length: ${Buffer.byteLength(PAGE_502)}\r\n\r\n${PAGE_502}`
+            `Content-Length: ${Buffer.byteLength(page)}\r\n\r\n${page}`
         );
       } else {
         socket.destroy();

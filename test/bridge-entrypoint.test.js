@@ -162,7 +162,7 @@ test('no author configured and none in the environment: the entrypoint warns and
 
 const EXPECTED_BRIDGE_ENV = [
   'PATH', 'HOME', 'LANG', 'LIIVO_REPO_DIR', 'LIIVO_PREVIEW_PORT', 'LIIVO_GATEWAY_URL', 'LIIVO_INSTANCE', 'OSC_HOSTNAME',
-  'LIIVO_PREVIEW_URL', 'LIIVO_BRIDGE_PORT', 'DISABLE_UPDATES', 'DISABLE_AUTOUPDATER',
+  'LIIVO_PREVIEW_URL', 'LIIVO_BRIDGE_PORT', 'LIIVO_DEFAULT_START', 'DISABLE_UPDATES', 'DISABLE_AUTOUPDATER',
 ];
 // what bash itself adds to a script's environment
 const SHELL_ADDED = new Set(['PWD', 'SHLVL', '_', 'OLDPWD']);
@@ -184,6 +184,7 @@ test('the bridge runs with env -i and the minimal list: the Claude credential an
   assert.strictEqual(env.DISABLE_UPDATES, '1');
   assert.strictEqual(env.DISABLE_AUTOUPDATER, '1');
   assert.strictEqual(env.LIIVO_BRIDGE_PORT, '4777');
+  assert.strictEqual(env.LIIVO_DEFAULT_START, path.join(w.lib, 'default-start.js'), 'the installed default start, for the bridge');
   assert.strictEqual(env.LIIVO_REPO_DIR, w.project);
   assert.strictEqual(env.LIIVO_INSTANCE, 'tenant-proj');
   assert.strictEqual(env.LIIVO_GATEWAY_URL, 'https://studio.example.test');
