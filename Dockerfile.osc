@@ -41,7 +41,7 @@ ARG CLAUDE_CODE_VERSION=2.1.323
 # assertion (first word of `claude --version` equals the pin) catches an installer that ignores the pinned argument or leaves no binary.
 RUN mise use -g node@22 && npm i -g corepack && corepack enable
 RUN bash -o pipefail -c 'curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION"' \
- && [ "$(claude --version | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}" ]
+ && [ "$(claude --version | head -n1 | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}" ]
 
 # Image copy of home, restored into an empty home volume on first start.
 USER root
