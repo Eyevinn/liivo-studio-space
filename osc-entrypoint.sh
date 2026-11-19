@@ -159,7 +159,9 @@ supervise_bridge() {
   local -a bridge_env
   while true; do
     rc=0
-    version="$(node "$FETCHER")" || rc=$?
+    # env -i: the fetcher needs only PATH (node, tar) and HOME (the signer socket and the cache); it gets
+    # none of the agent's or the Claude credential's variables.
+    version="$(env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" node "$FETCHER")" || rc=$?
     case "$version" in
       '' | *[!A-Za-z0-9._-]*) [ "$rc" -ne 0 ] || rc=3 ;;
     esac
@@ -217,6 +219,89 @@ mask_url() { echo "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/]*@#\1***@#';
 
 # Project checkout: clone on first start, leave it alone afterwards. A failed
 # clone does not stop the agent, so the workspace stays reachable for debugging.
+# A first clone that fails is retried in the background (clone_retry_loop below): a private
+# repository needs the edit proxy to have learned its tenant, which the gateway's first status
+# call teaches a moment after the first attempt has run.
+CLONE_LOG="$HOME/liivo-clone.log"
+clone_retry=""
+
+# Why a clone attempt failed, in a few words, read from its log (the log never holds a credential:
+# git does not print one and the helper prints only its cause).
+clone_cause() {
+  if grep -qi 'tenant not known' "$CLONE_LOG" 2>/dev/null; then
+    echo "the edit proxy does not know its tenant yet"
+  elif grep -qiE 'could not read (Username|Password)|authentication failed|no credentials|terminal prompts disabled' "$CLONE_LOG" 2>/dev/null; then
+    echo "authentication failed"
+  elif grep -qiE 'not found|does not appear to be a git repository' "$CLONE_LOG" 2>/dev/null; then
+    echo "repository not found"
+  elif grep -qiE 'invalid|unable to find remote helper|protocol' "$CLONE_LOG" 2>/dev/null; then
+    echo "invalid repository URL"
+  else
+    echo "see $CLONE_LOG"
+  fi
+}
+
+# One clone attempt; appends to the clone log with the time. Returns git's status. A failed attempt
+# removes only what it created: the directory when it did not exist before, otherwise what the attempt
+# put into the empty directory it found.
+clone_attempt() {
+  local n="$1" existed="" rc=0
+  [ ! -d "$PROJECT_DIR" ] || existed=1
+  printf '=== attempt %s at %s\n' "$n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CLONE_LOG"
+  git clone -- "$REPO_URL" "$PROJECT_DIR" >> "$CLONE_LOG" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ -z "$existed" ]; then
+      rm -rf "$PROJECT_DIR"
+    elif [ -d "$PROJECT_DIR" ] && [ ! -e "$PROJECT_DIR/.git/HEAD" ]; then
+      find "$PROJECT_DIR" -mindepth 1 -delete 2>/dev/null || true
+    fi
+    return "$rc"
+  fi
+  if [ -n "${REPO_BRANCH:-}" ]; then
+    (cd "$PROJECT_DIR" && { git checkout "$REPO_BRANCH" 2>/dev/null || git checkout -b "$REPO_BRANCH"; }) \
+      || log "WARNING: could not switch to branch $REPO_BRANCH"
+  fi
+  touch "$HOME/.liivo/project-cloned"
+}
+
+# True when a clone may start: no checkout and nothing in the project directory.
+clone_wanted() {
+  [ ! -d "$PROJECT_DIR/.git" ] && { [ ! -e "$PROJECT_DIR" ] || [ -z "$(ls -A "$PROJECT_DIR" 2>/dev/null)" ]; }
+}
+
+# Retries after the failed first attempt: waits LIIVO_CLONE_RETRY_DELAYS (default 5 10 20 40 s), then
+# LIIVO_CLONE_RETRY_STEADY (60 s), until the clone works or LIIVO_CLONE_RETRY_BUDGET (600 s) has passed.
+# One log line per attempt names the cause. It is one sequential loop, so two clones never run at once,
+# and it ends without cloning as soon as the project directory holds anything.
+CLONE_RETRY_DELAYS="${LIIVO_CLONE_RETRY_DELAYS:-5 10 20 40}"
+CLONE_RETRY_STEADY="${LIIVO_CLONE_RETRY_STEADY:-60}"
+CLONE_RETRY_BUDGET="${LIIVO_CLONE_RETRY_BUDGET:-600}"
+clone_retry_loop() {
+  local n=1 delay cause start="$SECONDS"
+  local -a delays
+  read -r -a delays <<< "$CLONE_RETRY_DELAYS"
+  while true; do
+    if [ "$n" -le "${#delays[@]}" ]; then delay="${delays[$((n - 1))]}"; else delay="$CLONE_RETRY_STEADY"; fi
+    cause="$(clone_cause)"
+    if [ $((SECONDS - start)) -ge "$CLONE_RETRY_BUDGET" ]; then
+      log "git clone attempt $n failed: $cause"
+      log "WARNING: git clone still failing after the retry budget (${CLONE_RETRY_BUDGET}s), giving up: $cause; restart the workspace or run git clone by hand (see $CLONE_LOG)"
+      return 1
+    fi
+    log "git clone attempt $n failed: $cause; next attempt in ${delay}s"
+    sleep "$delay"
+    if ! clone_wanted; then
+      log "$PROJECT_DIR is no longer empty, not cloning"
+      return 0
+    fi
+    n=$((n + 1))
+    if clone_attempt "$n"; then
+      log "git clone succeeded on attempt $n"
+      return 0
+    fi
+  done
+}
+
 if [ -n "${REPO_URL:-}" ]; then
   case "$REPO_URL" in
     -*) die "REPO_URL must not start with '-'" ;;
@@ -227,14 +312,10 @@ if [ -n "${REPO_URL:-}" ]; then
     log "WARNING: $PROJECT_DIR exists and is not a git checkout, skipping clone"
   else
     log "cloning $(mask_url "$REPO_URL") into $PROJECT_DIR"
-    if git clone -- "$REPO_URL" "$PROJECT_DIR" > "$HOME/liivo-clone.log" 2>&1; then
-      if [ -n "${REPO_BRANCH:-}" ]; then
-        (cd "$PROJECT_DIR" && { git checkout "$REPO_BRANCH" 2>/dev/null || git checkout -b "$REPO_BRANCH"; }) \
-          || log "WARNING: could not switch to branch $REPO_BRANCH"
-      fi
-      touch "$HOME/.liivo/project-cloned"
-    else
-      log "WARNING: git clone failed, see $HOME/liivo-clone.log (agent starts anyway)"
+    : > "$CLONE_LOG"
+    if ! clone_attempt 1; then
+      log "WARNING: git clone failed ($(clone_cause)), see $CLONE_LOG; retrying in the background (the agent starts anyway)"
+      clone_retry=1
     fi
   fi
 else
@@ -281,14 +362,22 @@ run_hooks() {
     fi
   fi
 }
-if [ -d "$PROJECT_DIR" ]; then
+start_hooks() {
+  [ -d "$PROJECT_DIR" ] || return 0
   (
     unset CODER_AGENT_TOKEN CODER_AGENT_URL CODER_AGENT_AUTH CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY
     # Project processes bind to loopback: the edit proxy is the only
     # listener on a non-loopback address (contract in docs/block.md).
     export HOST=127.0.0.1
     run_hooks
-  ) < /dev/null > "$HOME/liivo-run.log" 2>&1 &
+  ) < /dev/null > "$HOME/liivo-run.log" 2>&1
+}
+if [ -n "$clone_retry" ]; then
+  # The first clone failed: the hooks wait for the retries (until the clone works or the budget is
+  # spent), so a hook never runs against an empty directory. The agent below does not wait.
+  ( clone_retry_loop || true; start_hooks ) < /dev/null &
+else
+  start_hooks &
 fi
 
 # No Docker engine in the instance: switch off the agent's devcontainer

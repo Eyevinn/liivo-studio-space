@@ -39,6 +39,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- the archive ----
 
+// A pax header body is "<length> <key>=<value>\n" records, the length counting the whole record. A later
+// record for the same key wins (that is what tar does). Anything malformed refuses the archive.
+function paxRecords(body) {
+  const rec = new Map();
+  let at = 0;
+  while (at < body.length) {
+    const sp = body.indexOf(0x20, at);
+    const len = sp < 0 ? NaN : Number(body.subarray(at, sp).toString('latin1'));
+    if (!Number.isSafeInteger(len) || len < 1 || at + len > body.length || body[at + len - 1] !== 0x0a || sp + 1 >= at + len) throw new Error('a pax header is malformed');
+    const text = body.subarray(sp + 1, at + len - 1).toString('utf8');
+    const eq = text.indexOf('=');
+    if (eq < 1) throw new Error('a pax header is malformed');
+    rec.set(text.slice(0, eq), text.slice(eq + 1));
+    at += len;
+  }
+  return rec;
+}
+
 // Every member of a gzip'd tar as { name, type }, read from the headers (the tar program is not asked to
 // list: what is checked here is what a header says, and an entry kind that is not a plain file or directory
 // is refused). Handles GNU long names (`L`) and pax `path` records (`x`), which node_modules paths need.
@@ -70,8 +88,10 @@ function walkTar(gz) {
       continue;
     }
     if (type === 'x') {
-      const m = /(?:^|\n)\d+ path=([^\n]*)\n/.exec(body.toString('utf8'));
-      if (m) pending = m[1];
+      const rec = paxRecords(body);
+      if (rec.has('size') || rec.has('linkpath')) throw new Error('a pax header with size or linkpath is refused');
+      // tar applies the LAST path record, so this must too, or the check and the extraction disagree.
+      if (rec.has('path')) pending = rec.get('path');
       continue;
     }
     if (type === 'g') continue;
