@@ -74,13 +74,48 @@ fi
 mkdir -p "$HOME/.liivo"
 chmod 700 "$HOME/.liivo" 2>/dev/null || true
 
+# Git author. The image configures none, and the bridge commits after every turn (a commit without an
+# author fails). An identity the home volume already has is left alone: it is tested by the email, which
+# is what git refuses to commit without. The values are image ENV (Dockerfile.osc).
+if [ -z "$(git config --global user.email 2>/dev/null || true)" ]; then
+  if [ -n "${LIIVO_GIT_AUTHOR_NAME:-}" ] && [ -n "${LIIVO_GIT_AUTHOR_EMAIL:-}" ]; then
+    if git config --global user.name "$LIIVO_GIT_AUTHOR_NAME" && git config --global user.email "$LIIVO_GIT_AUTHOR_EMAIL"; then
+      log "git author set to $LIIVO_GIT_AUTHOR_NAME"
+    else
+      log "WARNING: could not set the git author"
+    fi
+  else
+    log "WARNING: no git author is configured and LIIVO_GIT_AUTHOR_NAME / LIIVO_GIT_AUTHOR_EMAIL are not set: commits in the workspace will fail"
+  fi
+fi
+
+# The bridge (amendment 6): fetched from the gateway at every start, verified, cached under
+# ~/.liivo/bridge and run by the supervisor below. The supervisor writes its state to state.json,
+# which the edit proxy reports in /__liivo/status; the file is written before the proxy starts so a
+# state left on the volume by an earlier run is never reported.
+BRIDGE_DIR="$HOME/.liivo/bridge"
+BRIDGE_PORT=4777
+mkdir -p "$BRIDGE_DIR"
+write_bridge_state() {
+  local tmp="$BRIDGE_DIR/.state.$$"
+  case "${2:-}" in
+    '') printf '{"state":"%s","version":null}\n' "$1" > "$tmp" ;;
+    *) printf '{"state":"%s","version":"%s"}\n' "$1" "$2" > "$tmp" ;;
+  esac
+  mv -f "$tmp" "$BRIDGE_DIR/state.json"
+}
+write_bridge_state starting
+
 # Edit proxy and preview forwarder on PORT. It is the tenant boundary: every
 # request needs its own session (docs/block.md). It forwards to
 # 127.0.0.1:$PREVIEW_PORT and is restarted by the loop if it exits. It starts
 # before the clone so the git credential helper can reach its signing socket.
 # It gets a clean environment (no tokens) and the handoff key on stdin, so the
 # key is in no environment block that project processes could inherit.
-FORWARDER=/usr/local/lib/liivo/preview-forwarder.js
+LIB_DIR="${LIIVO_LIB_DIR:-/usr/local/lib/liivo}"
+FORWARDER="$LIB_DIR/preview-forwarder.js"
+FETCHER="$LIB_DIR/bridge-fetch.js"
+forwarder_started=""
 # The orchestrator does not set PORT: the instance's container port is fixed at 8080.
 PORT="${PORT:-8080}"
 if [ "$PORT" = "$PREVIEW_PORT" ]; then
@@ -94,6 +129,7 @@ else
       rc=0
       printf '%s' "$handoff_key" | env -i PATH="$PATH" HOME="$HOME" PORT="$PORT" PREVIEW_PORT="$PREVIEW_PORT" \
         PROJECT_DIR="$PROJECT_DIR" LIIVO_INSTANCE="$LIIVO_INSTANCE" LIIVO_GATEWAY_URL="${LIIVO_GATEWAY_URL:-}" \
+        LIIVO_BRIDGE_PORT="$BRIDGE_PORT" \
         node "$FORWARDER" || rc=$?
       if [ "$rc" -eq 2 ]; then
         echo "osc-entrypoint: preview forwarder has a configuration error (exit 2), not restarting" >&2
@@ -106,8 +142,72 @@ else
     done
   ) < /dev/null &
   log "preview forwarder on port $PORT -> 127.0.0.1:$PREVIEW_PORT"
+  forwarder_started=1
 fi
 unset handoff_key
+
+# Bridge supervisor, in the background so the clone, the hooks and `exec coder agent` below are never
+# delayed. bridge-fetch.js waits for the edit proxy's signer (409 until the gateway has told the
+# workspace who it belongs to), fetches and verifies the bridge and prints its version (exit 3: no
+# verified bridge now; exit 2: it cannot work at all). The bridge runs with `env -i` and the list
+# below only: the Claude credential it needs, and nothing of the agent (no HANDOFF_KEY, no
+# CODER_AGENT_*) or of the other secrets. A gateway failure backs off 5, 10, 20, 40, then 60 s; the
+# bridge restarts after 1 to 30 s. The tenant's project code runs as the same uid and can reach the
+# bridge's files and loopback port; docs/block.md says so.
+supervise_bridge() {
+  local gw_delay=5 run_delay=1 rc version started bpid
+  local -a bridge_env
+  while true; do
+    rc=0
+    version="$(node "$FETCHER")" || rc=$?
+    case "$version" in
+      '' | *[!A-Za-z0-9._-]*) [ "$rc" -ne 0 ] || rc=3 ;;
+    esac
+    if [ "$rc" -eq 2 ]; then
+      log "bridge fetcher has a configuration error (exit 2), not restarting"
+      write_bridge_state unavailable
+      return 0
+    fi
+    if [ "$rc" -ne 0 ]; then
+      write_bridge_state unavailable
+      log "no verified bridge (fetcher exit $rc), trying again in ${gw_delay}s"
+      sleep "$gw_delay"
+      gw_delay=$((gw_delay * 2))
+      [ "$gw_delay" -le 60 ] || gw_delay=60
+      continue
+    fi
+    gw_delay=5
+    bridge_env=(PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}"
+      LIIVO_REPO_DIR="$PROJECT_DIR" LIIVO_PREVIEW_PORT="$PREVIEW_PORT"
+      LIIVO_GATEWAY_URL="${LIIVO_GATEWAY_URL:-}" LIIVO_INSTANCE="$LIIVO_INSTANCE"
+      OSC_HOSTNAME="${OSC_HOSTNAME:-}" LIIVO_PREVIEW_URL="${LIIVO_EDIT_URL:-}"
+      LIIVO_BRIDGE_PORT="$BRIDGE_PORT" DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1)
+    [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || bridge_env+=(CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
+    [ -z "${ANTHROPIC_API_KEY:-}" ] || bridge_env+=(ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
+    while true; do
+      started="$(date +%s)"
+      env -i "${bridge_env[@]}" node "$BRIDGE_DIR/current/package/server.mjs" &
+      bpid=$!
+      write_bridge_state running "$version"
+      printf '{"version":"%s","pid":%s,"startedAt":"%s"}\n' "$version" "$bpid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BRIDGE_DIR/running.json"
+      rc=0
+      wait "$bpid" || rc=$?
+      write_bridge_state starting "$version"
+      [ $(($(date +%s) - started)) -lt 60 ] || run_delay=1
+      log "bridge exited ($rc), restarting in ${run_delay}s"
+      sleep "$run_delay"
+      run_delay=$((run_delay * 2))
+      [ "$run_delay" -le 30 ] || run_delay=30
+    done
+  done
+}
+if [ -n "$forwarder_started" ] && [ -f "$FETCHER" ]; then
+  supervise_bridge < /dev/null &
+  log "bridge supervisor started"
+else
+  log "WARNING: no bridge supervisor (the preview forwarder or $FETCHER is missing)"
+  write_bridge_state unavailable
+fi
 
 # Never show credentials that may be embedded in a git URL. The userinfo part
 # ends at the LAST '@' before the first '/' after the scheme, so a password that
@@ -167,7 +267,18 @@ run_hooks() {
   fi
   if [ -f .liivo/start.sh ]; then
     echo "running .liivo/start.sh"
-    bash .liivo/start.sh || echo "start.sh exited with an error"
+    # The bridge stops and restarts start.sh through /tmp/liivo-start-<dir>.pid, which holds the id of a
+    # process group (it kills the group). So start.sh runs as the leader of its own session and the
+    # leader's id is written before it starts.
+    start_pid_file="/tmp/liivo-start-$(basename "$PROJECT_DIR").pid"
+    # shellcheck disable=SC2016 # $$ and $1 are for the inner bash, not this one
+    if command -v setsid >/dev/null 2>&1; then
+      setsid --wait bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "$start_pid_file" bash .liivo/start.sh \
+        || echo "start.sh exited with an error"
+    else
+      bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "$start_pid_file" bash .liivo/start.sh \
+        || echo "start.sh exited with an error"
+    fi
   fi
 }
 if [ -d "$PROJECT_DIR" ]; then

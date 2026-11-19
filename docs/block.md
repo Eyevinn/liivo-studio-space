@@ -24,7 +24,7 @@ in the maker order). `osc-entrypoint.sh` reads exactly these names.
 | `AgentToken` | `CODER_AGENT_TOKEN` | string | yes | yes | Coder agent token. Pass as a `{{secrets.x}}` reference. |
 | `PreviewPort` | `PREVIEW_PORT` | number | no | no | Port of the project's dev server. Default 3000. |
 | `HandoffKey` | `HANDOFF_KEY` | string | no | yes | Base64 of 32 bytes: the key the edit proxy checks handoff tokens and its session cookie against. Missing or invalid: the proxy answers 503 to every request (fail closed). |
-| `GatewayUrl` | `LIIVO_GATEWAY_URL` | string | no | no | Base URL of the Liivo Studio gateway: where a navigation without a session is redirected and where the git credential helper asks for a token. Missing: navigations answer 401 and the helper returns no credentials. |
+| `GatewayUrl` | `LIIVO_GATEWAY_URL` | string | no | no | Base URL of the Liivo Studio gateway: where a navigation without a session is redirected, where the git credential helper asks for a token and where the bridge is fetched. Missing: navigations answer 401, the helper returns no credentials and no bridge is fetched. |
 | `ClaudeCodeOauthToken` | `CLAUDE_CODE_OAUTH_TOKEN` | string | no | yes | The tenant's Claude OAuth token, passed as a `{{secrets.x}}` reference. The literal `unset` (or empty) means the tenant has none. |
 | `AnthropicApiKey` | `ANTHROPIC_API_KEY` | string | no | yes | The tenant's Anthropic API key, same rules. |
 
@@ -111,7 +111,14 @@ removed from the `Cookie` header; other cookies pass).
   links here so the browser passes the OSC gate on a gated path before an SPA's
   root loads).
 - `GET /__liivo/status` is the status endpoint (see below).
-- Every other path under `/__liivo/` is reserved and answers 404 (with a session).
+- `GET` and `HEAD` requests and WebSocket upgrades under `/__liivo/` (the chat,
+  its script and its WebSocket) go to the bridge on `127.0.0.1:4777`, after the
+  session check (see "The bridge" below). Any other method answers 405 and is not
+  forwarded.
+- `/__liivo/bridge/*`, `/__liivo/open/x`, `/__liivo/status/x`, `/__liivo/` and any
+  target that is not already in plain form (percent-encoded, dot segments, a
+  doubled slash, absolute-form, another letter case) are reserved and answer 404
+  (with a session), whatever the bridge does.
 
 ## Edit proxy session (tenant boundary, design D8)
 
@@ -130,7 +137,9 @@ session answer 401 instead of the redirect, and git credentials are unavailable.
 `v1.<payload>.<sig>`. `payload` is base64url of JSON
 `{aud, host, tenant, user, instance, exp, nonce}`; `sig` is base64url of
 HMAC-SHA256 under the 32 byte `HANDOFF_KEY` over the string `v1.<payload>`.
-`aud` is `browser`, `gateway` or `git`; `exp` is Unix seconds; `nonce` is 16
+`aud` is `browser`, `gateway` or `git` (the proxy verifies these three; the
+fourth, `bridge`, is only ever signed here and verified by the gateway, so a
+bridge token opens nothing in the workspace); `exp` is Unix seconds; `nonce` is 16
 random bytes in base64url. The signature is compared in constant time
 (`crypto.timingSafeEqual`). There is no lookup table: the key is derived per
 project by the gateway, so a token proves "signed for this project".
@@ -180,12 +189,16 @@ host is refused with 401 even with a valid cookie, because a sibling
 
 **Status.** `GET /__liivo/status` with `Authorization: Bearer <token aud=gateway>`
 (not single use, `exp` at most 60 s ahead) answers 200 JSON
-`{"checkout": bool, "clean": bool, "unpushed": number, "branch": string|null}`:
+`{"checkout": bool, "clean": bool, "unpushed": number, "branch": string|null,
+"bridge": {"version": string|null, "state": "running"|"starting"|"unavailable"}}`:
 a git checkout exists in the project directory; the working tree has no
 uncommitted or untracked files (with no checkout: the directory is empty);
 commits not on the upstream branch (or on no remote when the branch has no
-upstream); the current branch. Without a valid bearer: 401. If git itself fails:
-500, never "clean".
+upstream); the current branch; the bridge's state as the supervisor last wrote it
+to `$HOME/.liivo/bridge/state.json` (`unavailable` when the file is missing or not
+a state: the file is on a volume project code can write, so it is validated).
+`bridge` is additive: the gateway reads the named fields it knows. Without a valid
+bearer: 401. If git itself fails: 500, never "clean".
 
 **Git credential helper.** The image sets
 `credential.https://github.com.helper` (system config) to
@@ -202,6 +215,11 @@ to stderr naming the cause. The token is never in a URL, argument, file or
 environment variable. A private repository cannot be cloned by the first start
 of a new instance, because the tenant is learned from the first handoff or status
 call; the gateway's status poll teaches it, and a later `git pull` works.
+
+**Bridge token.** The same socket answers `POST /bridge-token` with an `aud`
+`bridge` token that lives 45 s (the browser tokens' slack for clock skew) and the
+gateway URL, for the bridge fetcher only. Both routes answer 409 until the tenant
+is known.
 
 **Contract for a project's dev server:** bind to `127.0.0.1:$PREVIEW_PORT`, not
 to `0.0.0.0`. The entrypoint exports `HOST=127.0.0.1` for `.liivo/setup.sh` and
@@ -221,6 +239,73 @@ Tests: `node --test 'forwarder/*.test.js' 'test/*.test.js'` (the second pattern
 runs the real `osc-entrypoint.sh` against a stub `coder`) and
 `shellcheck osc-entrypoint.sh`.
 
+## The bridge (chat and element picker, amendment 6)
+
+The chat with Claude and the element picker in the previewed page come from the
+**bridge**, a Node process the workspace fetches from the Liivo Studio gateway at
+every start. Its source stays in the private `Eyevinn/liivo-studio` (`bridge/`); the
+gateway image carries it as one tarball whose version is the gateway's build.
+
+- **Port and reach.** The bridge listens on `127.0.0.1:4777` (`LIIVO_BRIDGE_PORT`),
+  loopback only. The edit proxy forwards `GET`/`HEAD` and WebSocket requests under
+  `/__liivo/` to it after its session check, and injects
+  `<script src="/__liivo/client.js" defer>` into HTML page navigations. The bridge's
+  `POST /preview` (Claude's own preview tools) is never forwarded.
+- **Fetch** (`forwarder/bridge-fetch.js`, run by the supervisor in the entrypoint).
+  It polls the signer (`POST /bridge-token`) every 2 s while it answers 409 (the
+  gateway has not yet told the workspace who it belongs to), then reads
+  `GET ${LIIVO_GATEWAY_URL}/api/bridge/manifest` (`{protocol, version, sha256, size}`,
+  `protocol` 1 only, `size` at most 20 MiB). The tarball is reused from
+  `~/.liivo/bridge/<version>.tgz` when its sha256 is the manifest's, else downloaded
+  with a fresh token, cut off at the manifest's size, hashed while it is read and
+  compared before it is stored. Every member is checked before anything is extracted
+  (only `package/...`, no `..`, no absolute path, no link or device), the archive is
+  extracted into a fresh directory, `VERSION.json` must name the same version, and
+  `~/.liivo/bridge/current` points at it. The two newest tarballs are kept. **A file
+  whose sha256 did not match is never extracted and never run.** The gateway is
+  reached over https only.
+- **Failure behaviour.** The gateway refusing (401, 429, any 503, another protocol, a
+  bad manifest, a failed download) or not answering: the newest cached tarball whose
+  recorded hash still matches its bytes runs, else the fetcher exits 3 and the
+  supervisor tries again after 5, 10, 20, 40, then 60 s. While there is no bridge the
+  page's script is a small placeholder ("Chatten startar…", which polls
+  `/__liivo/health` and reloads once when the bridge answers, and after five minutes
+  says that the preview works without the chat), `/__liivo/health` answers 503
+  `{"bridge":"starting"}` and every other bridge path 503. The preview itself is
+  never affected. A bridge that exits is restarted after 1 to 30 s.
+- **Supervisor.** The clone, the hooks and `exec coder agent` never wait for it. The
+  bridge runs under `env -i` with `PATH`, `HOME`, `LANG`, `LIIVO_REPO_DIR`,
+  `LIIVO_PREVIEW_PORT`, `LIIVO_GATEWAY_URL`, `LIIVO_INSTANCE`, `OSC_HOSTNAME`,
+  `LIIVO_PREVIEW_URL` (the workspace's own public address), `LIIVO_BRIDGE_PORT`,
+  `DISABLE_UPDATES=1`, `DISABLE_AUTOUPDATER=1` and the tenant's Claude credential
+  (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, whichever it has) and nothing
+  else: no `HANDOFF_KEY`, no `CODER_AGENT_*`, no other secret. `state.json` (state and
+  version) and `running.json` (version, pid, start time) are written in
+  `~/.liivo/bridge/`; `/__liivo/status` reports the state.
+- **`.liivo/start.sh`.** The entrypoint runs it as the leader of its own process
+  group and writes its id to `/tmp/liivo-start-<project dir name>.pid`, which is how
+  the bridge stops and restarts it after it moved the checkout to newer code.
+- **Git author.** The image sets `LIIVO_GIT_AUTHOR_NAME=Liivo Studio` and
+  `LIIVO_GIT_AUTHOR_EMAIL=noreply@liivo.ai`. When `git config --global user.email` is
+  empty the entrypoint sets `user.name` and `user.email` from them; an identity the
+  home volume already has is left alone. The bridge commits after every turn, which
+  fails without an author.
+- **Claude Code** is installed pinned (`ARG CLAUDE_CODE_VERSION` in `Dockerfile.osc`,
+  at least 2.1.259; the bridge's flags are coupled to the version) and the bridge
+  starts it with updates switched off. The binary is seeded into the home volume
+  once: **a seeded home volume keeps its binary until a fresh volume** (a resumed or
+  a new project), so a new pin reaches existing workspaces only then.
+- **Secrecy.** "Private" means **private from the internet, not from tenant users.**
+  Every Studio workspace receives the full, unminified bridge source on its home
+  volume. Claude's tools, the project's scripts and any tenant member who reveals the
+  project's `HandoffKey` service secret can read or download it. Nobody without a
+  Studio project row can download it from the gateway. Do not put anything in
+  `bridge/` that must stay secret from customers.
+- **Same origin.** Scripts in the previewed page share the chat's origin, so they can
+  open `/__liivo/ws` and drive the chat (amendment 6, N1; closed for customers by
+  moving the chat to another origin, F2). The same uid in the workspace can reach the
+  bridge's loopback port and its files.
+
 ## Security notes
 
 - The entrypoint removes `CODER_AGENT_TOKEN`, `CODER_AGENT_URL` and
@@ -239,7 +324,7 @@ runs the real `osc-entrypoint.sh` against a stub `coder`) and
 - `HANDOFF_KEY` is removed from the environment of the Coder agent and of every
   process it starts, and reaches the forwarder only on stdin. It is still in the
   original environment block of every process forked from the entrypoint's bash
-  (the forwarder restart-loop subshell and the hooks subshell), PID 1 (tini)
+  (the forwarder restart-loop subshell, the bridge supervisor subshell and the hooks subshell), PID 1 (tini)
   included: bash's `unset` does not rewrite the initial environ block that
   `/proc/<pid>/environ` reads, and code running as the same uid can read it
   there. So this is hygiene and not isolation either. What that code could do with the key it can already

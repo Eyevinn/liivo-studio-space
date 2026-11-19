@@ -5,6 +5,9 @@
 // 127.0.0.1:PREVIEW_PORT, but only for a caller with this proxy's own session
 // (design D8): every request, `/` and upgrades included, on every address.
 // A session starts only from a gateway handoff token (forwarder/auth.js).
+// After the session check, GET/HEAD and WebSocket requests under /__liivo/ (except
+// open, status and bridge/) go to the Liivo Studio bridge on 127.0.0.1:4777, and
+// page navigations to the preview get the bridge's client script tag (inject.js).
 // node:http, node:net, node:crypto, node:fs only, no dependencies.
 const http = require('node:http');
 const net = require('node:net');
@@ -12,11 +15,21 @@ const fs = require('node:fs');
 const path = require('node:path');
 const auth = require('./auth.js');
 const { workspaceStatus } = require('./workspace-status.js');
+const inject = require('./inject.js');
 
 const RESERVED_PREFIX = '/__liivo/';
 const OPEN_PATH = '/__liivo/open';
 const STATUS_PATH = '/__liivo/status';
 const HANDOFF_PARAM = '__liivo';
+const DEFAULT_BRIDGE_PORT = 4777;
+// What of the /__liivo/ namespace the bridge may serve: a plain path of letters, digits, dots, dashes and
+// underscores, no dot segment, and not the proxy's own (`open`, `status`) or the reserved `bridge/`.
+const BRIDGE_PATH_RE = /^\/__liivo\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+const PROXY_OWN = new Set(['open', 'status', 'bridge']);
+const BRIDGE_STATES = new Set(['running', 'starting', 'unavailable']);
+const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const BRIDGE_STARTING = '{"bridge":"starting"}\n';
+const BRIDGE_TOKEN_SECONDS = 45;
 
 const PAGE_503 =
   '<!doctype html><html><head><meta charset="utf-8"><title>Project must be recreated</title></head>' +
@@ -29,7 +42,7 @@ const PAGE_401 =
 
 const PAGE_502 =
   '<!doctype html><html><head><meta charset="utf-8"><title>Preview not running</title></head>' +
-  "<body><h1>Preview not running</h1><p>The project's preview is not running.</p></body></html>\n";
+  `<body><h1>Preview not running</h1><p>The project's preview is not running.</p>${inject.tagFor('')}</body></html>\n`;
 
 // Normalised path of a request target, for the /__liivo/ checks only (the
 // forwarded target is never rewritten). Handles absolute-form targets
@@ -106,6 +119,31 @@ function isNavigation(req) {
   return (req.method === 'GET' || req.method === 'HEAD') && /text\/html/i.test(req.headers.accept || '');
 }
 
+// The path a request for the bridge asks for, or null when it is not one the bridge may serve. Only a request
+// target that is already in its plain form qualifies (nothing is rewritten on the way): no percent-encoding, no
+// repeated slash, no dot segment, no absolute-form target, and not `open`, `status` or `bridge/...` in any case.
+function bridgePathOf(url) {
+  const raw = String(url).split('?')[0];
+  if (!BRIDGE_PATH_RE.test(raw)) return null;
+  const parts = raw.split('/').slice(2);
+  if (parts.some((p) => p === '.' || p === '..')) return null;
+  if (PROXY_OWN.has(parts[0].toLowerCase())) return null;
+  return raw;
+}
+
+// What the supervisor wrote to ~/.liivo/bridge/state.json, validated: the volume is writable by project code.
+function readBridgeState(file) {
+  const unavailable = { version: null, state: 'unavailable' };
+  if (!file) return unavailable;
+  try {
+    const s = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!s || !BRIDGE_STATES.has(s.state)) return unavailable;
+    return { version: typeof s.version === 'string' && VERSION_RE.test(s.version) ? s.version : null, state: s.state };
+  } catch {
+    return unavailable;
+  }
+}
+
 // A browser request from another origin (a sibling *.osaas.io app is the same
 // site, so SameSite does not stop it) must not ride the session cookie when it
 // can change state or open a WebSocket.
@@ -132,6 +170,10 @@ function createForwarder({
   instance = '',
   projectDir = '',
   identityFile = '',
+  bridgePort = DEFAULT_BRIDGE_PORT,
+  bridgeStateFile = '',
+  injectMaxBytes = 8 * 1024 * 1024,
+  injectTimeoutMs = 10000,
   now = () => Math.floor(Date.now() / 1000),
 }) {
   const nonces = auth.createNonceStore();
@@ -226,7 +268,7 @@ function createForwarder({
       return text(res, 405, 'application/json', '{"error":"method not allowed"}\n', { Allow: 'GET' });
     }
     try {
-      const st = await workspaceStatus(projectDir);
+      const st = { ...(await workspaceStatus(projectDir)), bridge: readBridgeState(bridgeStateFile) };
       text(res, 200, 'application/json', `${JSON.stringify(st)}\n`);
     } catch (e) {
       text(res, 500, 'application/json', `${JSON.stringify({ error: e.message })}\n`);
@@ -268,21 +310,69 @@ function createForwarder({
       return;
     }
     if (isReserved(req.url)) {
+      const bridgePath = bridgePathOf(req.url);
+      if (bridgePath && (req.method === 'GET' || req.method === 'HEAD')) {
+        toBridge(req, res);
+        return;
+      }
       req.resume();
+      if (bridgePath) {
+        // The bridge's POST endpoint (/preview, for Claude's own tools) is loopback only and is never reached from here.
+        text(res, 405, 'text/plain', 'Method not allowed\n', { Allow: 'GET, HEAD' });
+        return;
+      }
       res.writeHead(404, { 'Content-Type': 'text/plain', 'Content-Length': '10' });
       res.end('Not found\n');
       return;
     }
+    toPreview(req, res);
+  });
+
+  // /__liivo/* to the bridge on loopback, GET and HEAD only. The bridge is not running (or not yet): the page script
+  // is replaced by the placeholder, everything else answers 503.
+  function toBridge(req, res) {
+    const up = http.request(
+      { host: '127.0.0.1', port: bridgePort, method: req.method, path: req.url, headers: forwardHeaders(req.headers), agent: false },
+      (upRes) => {
+        res.writeHead(upRes.statusCode, upRes.statusMessage, upRes.headers);
+        upRes.pipe(res);
+        upRes.on('error', () => res.destroy());
+      }
+    );
+    up.on('error', () => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      if (bridgePathOf(req.url) === inject.CLIENT_SRC) {
+        const body = inject.PLACEHOLDER_CLIENT;
+        text(res, 200, 'text/javascript; charset=utf-8', req.method === 'HEAD' ? '' : body, { 'Content-Length': Buffer.byteLength(body) });
+        return;
+      }
+      text(res, 503, 'application/json', req.method === 'HEAD' ? '' : BRIDGE_STARTING, { 'Retry-After': '2' });
+    });
+    res.on('close', () => up.destroy());
+    req.resume();
+    up.end();
+  }
+
+  // Everything else to the project's preview. A page navigation gets the client script tag (design D27).
+  function toPreview(req, res) {
+    const navigation = inject.isNavigationRequest(req);
     const upstream = http.request(
       {
         host: upstreamHost,
         port: previewPort,
         method: req.method,
         path: req.url,
-        headers: forwardHeaders(req.headers),
+        headers: navigation ? inject.navigationHeaders(forwardHeaders(req.headers)) : forwardHeaders(req.headers),
         agent: false,
       },
       (upRes) => {
+        if (navigation && inject.isTaggable(req.method, upRes.statusCode, upRes.headers)) {
+          tagged(upRes, res);
+          return;
+        }
         res.writeHead(upRes.statusCode, upRes.statusMessage, upRes.headers);
         upRes.pipe(res);
         upRes.on('error', () => res.destroy());
@@ -301,7 +391,47 @@ function createForwarder({
     });
     res.on('close', () => upstream.destroy());
     req.pipe(upstream);
-  });
+  }
+
+  // Buffers an HTML answer up to injectMaxBytes and injectTimeoutMs and sends it with the tag. When it is larger or
+  // slower than that, what is held is sent as the upstream gave it (its own headers, no tag) and the rest is streamed.
+  function tagged(upRes, res) {
+    const held = [];
+    let size = 0;
+    let settled = false;
+    const timer = setTimeout(passThrough, injectTimeoutMs);
+    function onData(chunk) {
+      held.push(chunk);
+      size += chunk.length;
+      if (size > injectMaxBytes) passThrough();
+    }
+    function passThrough() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      upRes.removeListener('data', onData);
+      upRes.removeListener('end', onEnd);
+      res.writeHead(upRes.statusCode, upRes.statusMessage, upRes.rawHeaders);
+      for (const c of held) res.write(c);
+      upRes.pipe(res);
+    }
+    function onEnd() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const body = Buffer.concat(held);
+      const nonce = inject.findNonce(upRes.headers['content-security-policy'], body.toString('latin1'));
+      res.writeHead(upRes.statusCode, upRes.statusMessage, inject.taggedHeaders(upRes.rawHeaders));
+      res.end(inject.insertTag(body, nonce));
+    }
+    upRes.on('data', onData);
+    upRes.on('end', onEnd);
+    upRes.on('error', () => {
+      clearTimeout(timer);
+      res.destroy();
+    });
+    res.on('close', () => clearTimeout(timer));
+  }
 
   server.on('upgrade', (req, socket, head) => {
     socket.on('error', () => socket.destroy());
@@ -314,16 +444,20 @@ function createForwarder({
       reply('401 Unauthorized');
       return;
     }
-    if (isReserved(req.url)) {
+    // /__liivo/ws and the like go to the bridge, in the same tunnel as the preview's own upgrades (its HMR).
+    const toBridge = Boolean(bridgePathOf(req.url));
+    if (isReserved(req.url) && !toBridge) {
       reply('404 Not Found');
       return;
     }
-    const upstream = net.connect(previewPort, upstreamHost);
+    const upstream = toBridge ? net.connect(bridgePort, '127.0.0.1') : net.connect(previewPort, upstreamHost);
     let established = false;
     upstream.on('error', () => {
       // Never write a 502 page into a stream that is already past the handshake.
       if (established) {
         socket.destroy();
+      } else if (toBridge && socket.writable) {
+        socket.end(`HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\nRetry-After: 2\r\n\r\n`);
       } else if (socket.writable) {
         socket.end(
           'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/html; charset=utf-8\r\n' +
@@ -370,19 +504,24 @@ function createForwarder({
     req.resume();
     const inst = identity.instance || instance;
     const refuse = (status, msg) => text(res, status, 'application/json', `${JSON.stringify({ error: msg })}\n`);
-    if (req.method !== 'POST' || req.url !== '/git-token') return refuse(404, 'not found');
+    // /git-token: the credential helper (audience git, 60 s); /bridge-token: the bridge fetcher (audience bridge, 45 s,
+    // the browser tokens' slack for clock skew).
+    let audience = null;
+    if (req.method === 'POST' && req.url === '/git-token') audience = ['git', 60];
+    if (req.method === 'POST' && req.url === '/bridge-token') audience = ['bridge', BRIDGE_TOKEN_SECONDS];
+    if (!audience) return refuse(404, 'not found');
     if (!handoffKey) return refuse(503, 'HANDOFF_KEY is not set');
     if (!gatewayUrl) return refuse(503, 'LIIVO_GATEWAY_URL is not set');
     if (!identity.tenant || !inst) {
       return refuse(409, 'tenant not known yet: no handoff or status call has reached this workspace');
     }
     const token = auth.signToken(handoffKey, {
-      aud: 'git',
+      aud: audience[0],
       host: '',
       tenant: identity.tenant,
       user: identity.user,
       instance: inst,
-      exp: now() + 60,
+      exp: now() + audience[1],
     });
     text(res, 200, 'application/json', `${JSON.stringify({ token, gatewayUrl })}\n`);
   });
@@ -457,6 +596,8 @@ async function main() {
     instance: process.env.LIIVO_INSTANCE || '',
     projectDir: process.env.PROJECT_DIR || path.join(home, 'project'),
     identityFile: path.join(home, '.liivo', 'identity.json'),
+    bridgePort: process.env.LIIVO_BRIDGE_PORT ? parsePort('LIIVO_BRIDGE_PORT', process.env.LIIVO_BRIDGE_PORT) : DEFAULT_BRIDGE_PORT,
+    bridgeStateFile: path.join(home, '.liivo', 'bridge', 'state.json'),
   });
   try {
     await listenOnSocket(server.signer, process.env.LIIVO_SOCKET || path.join(home, '.liivo', 'sign.sock'));
