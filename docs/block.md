@@ -212,9 +212,32 @@ the password (user name `x-access-token`). If the gateway refuses, is
 unreachable, or the tenant is not known yet, it returns nothing, git goes on
 unauthenticated (public repositories still clone) and the helper writes one line
 to stderr naming the cause. The token is never in a URL, argument, file or
-environment variable. A private repository cannot be cloned by the first start
-of a new instance, because the tenant is learned from the first handoff or status
-call; the gateway's status poll teaches it, and a later `git pull` works.
+environment variable. The tenant is learned from the first handoff or status
+call, which reaches a new instance a moment after the entrypoint's first clone, so
+a private repository fails that first attempt. The entrypoint therefore retries
+the clone in the background (see "First clone and retry" below).
+
+### First clone and retry
+
+The entrypoint clones `REPO_URL` into the project directory once, only when that
+directory has no checkout and no files. When that first attempt fails it logs one
+line naming the cause and retries in the background after 5, 10, 20 and 40 s, then
+every 60 s, until the clone succeeds or 10 minutes have passed since the first
+failure. Every attempt is one sequential step,
+so two clones never run at once; an attempt is skipped, and the retry ends, as soon
+as the directory holds a checkout or any file; a failed attempt removes only what it
+created (the directory it made, or the files it put into the empty directory it
+found). Every attempt is logged in `~/liivo-clone.log` with its time and in the
+entrypoint log with its cause (the tenant is not known yet, authentication failed,
+repository not found, invalid URL). A permanent failure is retried the same way, so
+the log says why. The URL is masked in the log. When the clone succeeds,
+`~/.liivo/project-cloned` is written. `.liivo/setup.sh` and `.liivo/start.sh` run
+after the clone succeeded or the budget is spent, never against an empty directory
+while a retry is pending; the agent and the edit proxy start at once and do not
+wait. If the repository is still unreachable after the budget, restart the
+workspace or run `git clone` or `git pull` by hand. The delays and budget can be
+changed with `LIIVO_CLONE_RETRY_DELAYS`, `LIIVO_CLONE_RETRY_STEADY` and
+`LIIVO_CLONE_RETRY_BUDGET` (seconds; used by the tests).
 
 **Bridge token.** The same socket answers `POST /bridge-token` with an `aud`
 `bridge` token that lives 45 s (the browser tokens' slack for clock skew) and the
@@ -274,6 +297,7 @@ gateway image carries it as one tarball whose version is the gateway's build.
   `{"bridge":"starting"}` and every other bridge path 503. The preview itself is
   never affected. A bridge that exits is restarted after 1 to 30 s.
 - **Supervisor.** The clone, the hooks and `exec coder agent` never wait for it. The
+  fetcher runs under `env -i` with `PATH`, `HOME` and `LANG` only. The
   bridge runs under `env -i` with `PATH`, `HOME`, `LANG`, `LIIVO_REPO_DIR`,
   `LIIVO_PREVIEW_PORT`, `LIIVO_GATEWAY_URL`, `LIIVO_INSTANCE`, `OSC_HOSTNAME`,
   `LIIVO_PREVIEW_URL` (the workspace's own public address), `LIIVO_BRIDGE_PORT`,

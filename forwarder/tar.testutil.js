@@ -29,6 +29,14 @@ function header(name, { type = '0', size = 0, mode = 0o644, link = '' } = {}) {
 
 const pad = (buf) => Buffer.concat([buf, Buffer.alloc((512 - (buf.length % 512)) % 512)]);
 
+// One pax record: "<length> <key>=<value>\n", the length counting itself.
+function paxRecord(key, value) {
+  const rest = ` ${key}=${value}\n`;
+  let len = Buffer.byteLength(rest) + 1;
+  while (String(len).length + Buffer.byteLength(rest) !== len) len = String(len).length + Buffer.byteLength(rest);
+  return Buffer.from(`${len}${rest}`);
+}
+
 // entries: [{ name, data?: string|Buffer, type?, link? }]. A name over 100 bytes is written as GNU does (an `L` entry).
 function tgz(entries) {
   const parts = [];
@@ -41,6 +49,11 @@ function tgz(entries) {
       name = name.slice(0, 99);
     }
     const type = e.type || (e.name.endsWith('/') ? '5' : '0');
+    if (e.pax) {
+      // e.pax: [[key, value], ...] written as one pax extended header before the member.
+      const body = Buffer.concat(e.pax.map(([k, v]) => paxRecord(k, v)));
+      parts.push(header('PaxHeader/x', { type: 'x', size: body.length }), pad(body));
+    }
     parts.push(header(name, { type, size: type === '0' ? data.length : 0, link: e.link || '', mode: type === '5' ? 0o755 : 0o644 }));
     if (type === '0') parts.push(pad(data));
   }

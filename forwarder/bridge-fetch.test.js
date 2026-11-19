@@ -4,6 +4,7 @@
 const { test, afterEach } = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
+const zlib = require('node:zlib');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -250,6 +251,27 @@ test('walkTar and checkMembers: a plain package passes (the passing path), anyth
   assert.ok(members.some((m) => m.name.length > 100), 'the long name is read from its L entry');
   assert.throws(() => checkMembers([]), /empty/);
   assert.throws(() => walkTar(Buffer.from('not gzip')), /not a gzip/);
+});
+
+test('walkTar takes the LAST pax path record, as tar does, so a duplicate-path archive is refused by the member check', () => {
+  const dup = tgz([{ name: 'package/' }, { name: 'package/ok.txt', data: 'x', pax: [['path', 'package/ok.txt'], ['path', '../../escaped.txt']] }]);
+  const members = walkTar(dup);
+  assert.deepStrictEqual(members.map((m) => m.name), ['package/', '../../escaped.txt']);
+  assert.throws(() => checkMembers(members), /outside package/);
+  // the passing path: a single pax path record, and a later one that stays inside package/
+  const ok = walkTar(tgz([{ name: 'package/' }, { name: 'package/a.txt', data: 'x', pax: [['path', 'package/b.txt'], ['mtime', '1'], ['path', 'package/c.txt']] }]));
+  assert.strictEqual(ok[1].name, 'package/c.txt');
+  assert.doesNotThrow(() => checkMembers(ok));
+});
+
+test('a pax header that carries size or linkpath, or is malformed, is refused', () => {
+  for (const pax of [[['size', '5']], [['linkpath', '/etc/passwd']], [['path', 'package/a.txt'], ['size', '0']]]) {
+    assert.throws(() => walkTar(tgz([{ name: 'package/' }, { name: 'package/a.txt', data: 'x', pax }])), /size or linkpath/);
+  }
+  const bad = tgz([{ name: 'package/' }, { name: 'package/a.txt', data: 'x', pax: [['path', 'package/a.txt']] }]);
+  const raw = zlib.gunzipSync(bad);
+  raw[1024 + 1] = 0x39; // corrupt the record length digits in the pax body
+  assert.throws(() => walkTar(zlib.gzipSync(raw)), /pax header is malformed/);
 });
 
 test('a package whose VERSION.json names another version, or that has no server.mjs, is not installed', async () => {

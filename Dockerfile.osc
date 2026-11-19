@@ -37,8 +37,11 @@ WORKDIR /home/coder
 # for the permission prompts it relays; 2.1.323 is what its stream-json round trip was run
 # against). The bridge starts it with DISABLE_UPDATES=1, so the pinned binary is the one that runs.
 ARG CLAUDE_CODE_VERSION=2.1.323
-RUN mise use -g node@22 && npm i -g corepack && corepack enable \
- && curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION}
+# pipefail: a failed download must fail the build (a plain pipe reports only bash's status). The version
+# assertion (first word of `claude --version` equals the pin) catches an installer that ignores the pinned argument or leaves no binary.
+RUN mise use -g node@22 && npm i -g corepack && corepack enable
+RUN bash -o pipefail -c 'curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION"' \
+ && [ "$(claude --version | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}" ]
 
 # Image copy of home, restored into an empty home volume on first start.
 USER root
