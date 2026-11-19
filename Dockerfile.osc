@@ -33,8 +33,12 @@ ENV MISE_DATA_DIR=/home/coder/.local/share/mise \
 USER coder
 WORKDIR /home/coder
 # A default Node so Claude Code and JS projects work before any project setup.
+# Claude Code is pinned: the bridge's flags are coupled to the CLI version (at least 2.1.259
+# for the permission prompts it relays; 2.1.323 is what its stream-json round trip was run
+# against). The bridge starts it with DISABLE_UPDATES=1, so the pinned binary is the one that runs.
+ARG CLAUDE_CODE_VERSION=2.1.323
 RUN mise use -g node@22 && npm i -g corepack && corepack enable \
- && curl -fsSL https://claude.ai/install.sh | bash
+ && curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION}
 
 # Image copy of home, restored into an empty home volume on first start.
 USER root
@@ -44,7 +48,7 @@ COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
 # module, the git status reader and the git credential helper. Every file the
 # forwarder requires must be listed here. Uses the default Node from mise, which
 # the entrypoint has on PATH.
-COPY --chmod=644 forwarder/preview-forwarder.js forwarder/auth.js forwarder/workspace-status.js forwarder/git-credential-liivo.js /usr/local/lib/liivo/
+COPY --chmod=644 forwarder/preview-forwarder.js forwarder/auth.js forwarder/workspace-status.js forwarder/git-credential-liivo.js forwarder/inject.js forwarder/bridge-fetch.js /usr/local/lib/liivo/
 # Git credentials for github.com come from the gateway through the edit proxy;
 # the helper prints nothing (git goes unauthenticated) when that fails.
 RUN git config --system 'credential.https://github.com.helper' '!node /usr/local/lib/liivo/git-credential-liivo.js'
@@ -52,4 +56,7 @@ RUN git config --system 'credential.https://github.com.helper' '!node /usr/local
 USER 1000:1000
 # The orchestrator does not set PORT; the container port is fixed at 8080.
 ENV PORT=8080
+# The commit author of the bridge's per-turn commits; the entrypoint sets it when the home volume has no
+# git identity (N3, birme on Eyevinn/liivo-studio#44).
+ENV LIIVO_GIT_AUTHOR_NAME="Liivo Studio" LIIVO_GIT_AUTHOR_EMAIL="noreply@liivo.ai"
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/osc-entrypoint.sh"]

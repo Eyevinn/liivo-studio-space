@@ -17,6 +17,7 @@ const KEY = crypto.randomBytes(32);
 const OTHER_KEY = crypto.randomBytes(32);
 const HOST = 'tenant-proj.eyevinn-liivo-studio-space.auto.dev.osaas.io';
 const GATEWAY = 'https://gw.example.test';
+const NO_BRIDGE = { version: null, state: 'unavailable' };
 let clock = 1_800_000_000;
 const now = () => clock;
 
@@ -451,13 +452,13 @@ test('status with a gateway token is not single use and reports no checkout, the
   const t = gatewayToken({ nonce: 'same' });
   let res = await status(t);
   assert.strictEqual(res.status, 200);
-  assert.deepStrictEqual(JSON.parse(res.body), { checkout: false, clean: true, unpushed: 0, branch: null });
+  assert.deepStrictEqual(JSON.parse(res.body), { checkout: false, clean: true, unpushed: 0, branch: null, bridge: NO_BRIDGE });
   assert.strictEqual((await status(t)).status, 200);
 
   // files that are not a git checkout count as work that would be lost
   fs.mkdirSync(projectDir, { recursive: true });
   fs.writeFileSync(path.join(projectDir, 'notes.txt'), 'x');
-  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: false, clean: false, unpushed: 0, branch: null });
+  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: false, clean: false, unpushed: 0, branch: null, bridge: NO_BRIDGE });
   fs.rmSync(path.join(projectDir, 'notes.txt'));
 
   // an upstream and a checkout with one commit pushed
@@ -466,21 +467,21 @@ test('status with a gateway token is not single use and reports no checkout, the
   git(projectDir, 'init', '-b', 'main');
   git(projectDir, 'remote', 'add', 'origin', bare);
   res = await status(gatewayToken());
-  assert.deepStrictEqual(JSON.parse(res.body), { checkout: true, clean: true, unpushed: 0, branch: 'main' });
+  assert.deepStrictEqual(JSON.parse(res.body), { checkout: true, clean: true, unpushed: 0, branch: 'main', bridge: NO_BRIDGE });
 
   fs.writeFileSync(path.join(projectDir, 'a.txt'), 'a');
   git(projectDir, 'add', '.');
   git(projectDir, 'commit', '-m', 'one');
   // a branch with no upstream: the commit is on no remote
-  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: true, clean: true, unpushed: 1, branch: 'main' });
+  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: true, clean: true, unpushed: 1, branch: 'main', bridge: NO_BRIDGE });
   git(projectDir, 'push', '-u', 'origin', 'main');
-  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: true, clean: true, unpushed: 0, branch: 'main' });
+  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: true, clean: true, unpushed: 0, branch: 'main', bridge: NO_BRIDGE });
 
   fs.writeFileSync(path.join(projectDir, 'a.txt'), 'changed');
-  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: true, clean: false, unpushed: 0, branch: 'main' });
+  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: true, clean: false, unpushed: 0, branch: 'main', bridge: NO_BRIDGE });
   git(projectDir, 'commit', '-am', 'two');
   fs.writeFileSync(path.join(projectDir, 'untracked.txt'), 'u');
-  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: true, clean: false, unpushed: 1, branch: 'main' });
+  assert.deepStrictEqual(JSON.parse((await status(gatewayToken())).body), { checkout: true, clean: false, unpushed: 1, branch: 'main', bridge: NO_BRIDGE });
 });
 
 test('status answers 405 to a method other than GET (after authentication)', async () => {
