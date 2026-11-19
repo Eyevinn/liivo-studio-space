@@ -117,7 +117,7 @@ before(async () => {
       return res.writeHead(200, { 'content-type': 'text/html' }).end(`<html><head><meta http-equiv="Content-Security-Policy" content="script-src 'nonce-metaNonce12345'"></head><body>x</body></html>`);
     }
     if (u === '/csp-hostile') {
-      return res.writeHead(200, { 'content-type': 'text/html', 'content-security-policy': `script-src 'nonce-a"><img src=x onerror=alert(1)>'` }).end(html('x'));
+      return res.writeHead(200, { 'content-type': 'text/html', 'content-security-policy': `script-src 'nonce-abcdefgh"onload="alert(1)'` }).end(html('x'));
     }
     if (u === '/gzip') return res.writeHead(200, { 'content-type': 'text/html', 'content-encoding': 'gzip' }).end(zlib.gzipSync(html('zipped')));
     if (u === '/json') return res.writeHead(200, { 'content-type': 'application/json' }).end('{"a":"</body>"}');
