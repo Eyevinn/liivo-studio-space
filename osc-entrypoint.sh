@@ -273,16 +273,27 @@ mask_url() { echo "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/]*@#\1***@#';
 CLONE_LOG="$HOME/liivo-clone.log"
 clone_retry=""
 
-# Why a clone attempt failed, in a few words, read from its log (the log never holds a credential:
-# git does not print one and the helper prints only its cause).
+# Every git clone attempt, the foreground first one and each retry, runs under a wall-clock limit
+# (LIIVO_CLONE_TIMEOUT, 120 s). A git that ignores SIGTERM is killed by SIGKILL after the grace
+# (LIIVO_CLONE_KILL_GRACE, 10 s), so no attempt can hold the entrypoint without end.
+CLONE_TIMEOUT="${LIIVO_CLONE_TIMEOUT:-120}"
+CLONE_KILL_GRACE="${LIIVO_CLONE_KILL_GRACE:-10}"
+
+# Why the latest clone attempt failed, in a few words, read from that attempt's own part of the log:
+# the text after the last "=== attempt" line, never an earlier attempt's output (the log never holds a
+# credential: git does not print one and the helper prints only its cause).
 clone_cause() {
-  if grep -qi 'tenant not known' "$CLONE_LOG" 2>/dev/null; then
+  local text
+  text="$(awk '/^=== attempt /{buf=""; next} {buf = buf $0 "\n"} END{printf "%s", buf}' "$CLONE_LOG" 2> /dev/null)"
+  if printf '%s' "$text" | grep -q 'liivo-clone: timed out after'; then
+    printf '%s' "$text" | grep -o 'timed out after [0-9]*s' | tail -n1
+  elif printf '%s' "$text" | grep -qi 'tenant not known'; then
     echo "the edit proxy does not know its tenant yet"
-  elif grep -qiE 'could not read (Username|Password)|authentication failed|no credentials|terminal prompts disabled' "$CLONE_LOG" 2>/dev/null; then
+  elif printf '%s' "$text" | grep -qiE 'could not read (Username|Password)|authentication failed|no credentials|terminal prompts disabled'; then
     echo "authentication failed"
-  elif grep -qiE 'not found|does not appear to be a git repository' "$CLONE_LOG" 2>/dev/null; then
+  elif printf '%s' "$text" | grep -qiE 'not found|does not appear to be a git repository'; then
     echo "repository not found"
-  elif grep -qiE 'invalid|unable to find remote helper|protocol' "$CLONE_LOG" 2>/dev/null; then
+  elif printf '%s' "$text" | grep -qiE 'invalid|unable to find remote helper|protocol'; then
     echo "invalid repository URL"
   else
     echo "see $CLONE_LOG"
@@ -291,17 +302,30 @@ clone_cause() {
 
 # One clone attempt; appends to the clone log with the time. Returns git's status. A failed attempt
 # removes only what it created: the directory when it did not exist before, otherwise what the attempt
-# put into the empty directory it found.
+# put into the empty directory it found. An attempt that git ended by the time limit or by a signal
+# (status 124, or above 128) owns whatever it left, a partial .git included. An attempt that exited by
+# itself with .git/HEAD present leaves the directory alone: that can be a checkout made by hand.
 clone_attempt() {
-  local n="$1" existed="" rc=0
+  local n="$1" existed="" rc=0 t0 elapsed_us killed=""
   [ ! -d "$PROJECT_DIR" ] || existed=1
   printf '=== attempt %s at %s\n' "$n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CLONE_LOG"
-  git clone -- "$REPO_URL" "$PROJECT_DIR" >> "$CLONE_LOG" 2>&1 || rc=$?
+  t0="${EPOCHREALTIME/./}"
+  timeout -k "$CLONE_KILL_GRACE" "$CLONE_TIMEOUT" git clone -- "$REPO_URL" "$PROJECT_DIR" >> "$CLONE_LOG" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
+    elapsed_us=$((${EPOCHREALTIME/./} - t0))
+    # timeout exits 124 on the limit and 137 when it needed SIGKILL; a git that killed itself also gives
+    # 137, so that status counts as the limit only when the attempt ran for the whole limit.
+    if [ "$rc" -eq 124 ] || { [ "$rc" -eq 137 ] && [ "$elapsed_us" -ge $((CLONE_TIMEOUT * 1000000)) ]; }; then
+      printf 'liivo-clone: timed out after %ss, git was stopped\n' "$CLONE_TIMEOUT" >> "$CLONE_LOG"
+    fi
+    if [ "$rc" -eq 124 ] || [ "$rc" -gt 128 ]; then killed=1; fi
     if [ -z "$existed" ]; then
       rm -rf "$PROJECT_DIR"
-    elif [ -d "$PROJECT_DIR" ] && [ ! -e "$PROJECT_DIR/.git/HEAD" ]; then
-      find "$PROJECT_DIR" -mindepth 1 -delete 2>/dev/null || true
+    elif [ -d "$PROJECT_DIR" ] && { [ -n "$killed" ] || [ ! -e "$PROJECT_DIR/.git/HEAD" ]; }; then
+      if [ -n "$killed" ] && [ -n "$(ls -A "$PROJECT_DIR" 2> /dev/null)" ]; then
+        printf 'liivo-clone: removed the partial checkout the stopped attempt left in %s\n' "$PROJECT_DIR" >> "$CLONE_LOG"
+      fi
+      find "$PROJECT_DIR" -mindepth 1 -delete 2> /dev/null || true
     fi
     return "$rc"
   fi
