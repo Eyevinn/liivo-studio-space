@@ -264,6 +264,59 @@ changed with `LIIVO_CLONE_RETRY_DELAYS`, `LIIVO_CLONE_RETRY_STEADY` and
 `LIIVO_CLONE_KILL_GRACE` (default 10), both in seconds. They are variables of the
 entrypoint, not options in the maker order.
 
+**Default start (a repository without `.liivo/start.sh`).**
+
+When the repository has no `.liivo/start.sh`, the entrypoint runs `default-start.js`
+(installed as `/usr/local/lib/liivo/default-start.js`, mode 755, Node built-ins only)
+through the same `setsid` wrapper as an own start.sh, so `/tmp/liivo-start-<dir>.pid`
+holds its group leader from the first moment and install, build and the dev server are
+in that group. A repository's own `.liivo/start.sh` always wins (any file, executable
+or not): nothing of the default runs, the state file is never read, the page is the
+unchanged one. Nothing is generated into the repository.
+
+- **Detection.** `package.json` in the root; the script is `scripts.dev`, else
+  `scripts.start`. Neither (or no or invalid `package.json`): nothing starts and the
+  state is `none` with the reason. Lockfile order: `pnpm-lock.yaml` (pnpm), `yarn.lock`
+  (yarn), `package-lock.json` or `npm-shrinkwrap.json` (npm), none (npm). With several,
+  the first wins and the log names the others. Only a bun lockfile: `failed`, add
+  `.liivo/start.sh`. Other stacks and monorepo workspaces are out of scope.
+- **Install never writes a tracked file.** npm `ci`; pnpm `install --frozen-lockfile`;
+  yarn `install --frozen-lockfile` (yarn 1) or `--immutable` (yarn 2 and later, read
+  from `yarn --version`); no lockfile: `npm install --no-package-lock`. A frozen install
+  that fails is a failure, never retried with a lockfile-writing install. The install
+  runs when there is no record, the lockfile hash (of `package.json` without a lockfile)
+  differs from the record in `~/.liivo/default-start-<dir>.install`, or `node_modules`
+  is missing. A failed, stopped or timed-out install records nothing.
+- **Clean tree.** When git does not ignore `node_modules`, `/node_modules/` is added to
+  `.git/info/exclude` (local, never committed) before the install, because the bridge
+  commits with `git add -A`.
+- **Build.** When the script is `start` and `package.json` has `build`, `build` runs
+  before `start` on every start. `dev` never builds.
+- **Port and host.** The port is `LIIVO_PREVIEW_PORT` (not `LIIVO_PORT`). Every script
+  gets `PORT=<port>` and `HOST=127.0.0.1`. A single `next dev`, `next start`, `vite`,
+  `vite dev`, `vite serve` or `vite preview` script also gets `-H 127.0.0.1 -p <port>`
+  or `--host 127.0.0.1 --port <port> --strictPort` appended once (npm passes them after
+  `--`). A compound command or a script with its own host or port flag gets only the
+  environment and one log line.
+- **Limits** (entrypoint variables, not maker options): `LIIVO_DEFAULT_INSTALL_TIMEOUT`
+  (900 s, shared by install and build), `LIIVO_DEFAULT_START_TIMEOUT` (300 s until the
+  port accepts a connection), `LIIVO_DEFAULT_KILL_GRACE` (10 s between SIGTERM and
+  SIGKILL). A limit that fires stops the work it timed.
+- **Log and state.** Output and one `=== <UTC time> default start: <step and command>`
+  line per step go to `/tmp/liivo-start-<dir>.log`; `~/liivo-run.log` names that file.
+  `/tmp/liivo-start-<dir>.state` is JSON `{"state","reason"}` with state `installing`,
+  `starting`, `running`, `failed` or `none`. A SIGTERM (a bridge restart) writes nothing.
+  The entrypoint removes a leftover state file at start.
+- **Page.** The 502 "Preview not running" page keeps its title, heading and chat tag and
+  adds a status line (installing, starting, failed with the reason and the log path,
+  nothing to start), and reloads itself every 4 s while installing or starting. The state
+  file is untrusted input: a regular file below 2 KiB, a known state, an escaped and
+  capped reason, no log content; anything else gives the page as it was.
+- **Refresh restart.** The entrypoint passes `LIIVO_DEFAULT_START` (the installed path)
+  to the bridge. Until the bridge in Eyevinn/liivo-studio uses it, a refresh does not
+  restart a default-started dev server (Next.js and Vite hot-reload), and a lockfile
+  changed by a refresh is installed at the next workspace start.
+
 **Bridge token.** The same socket answers `POST /bridge-token` with an `aud`
 `bridge` token that lives 45 s (the browser tokens' slack for clock skew) and the
 gateway URL, for the bridge fetcher only. Both routes answer 409 until the tenant
