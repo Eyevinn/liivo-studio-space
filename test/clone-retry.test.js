@@ -284,7 +284,7 @@ const cloneLog = (w) => read(path.join(w.home, 'liivo-clone.log'));
 
 test('the cause of each attempt comes from that attempt only: tenant, then not found, then authentication, and the giving-up line names the last', async () => {
   const w = setup({ gitScript: ['tenant', 'notfound', 'auth'] });
-  const r = await run(w, { LIIVO_CLONE_RETRY_BUDGET: '1' });
+  const r = await run(w, { LIIVO_CLONE_RETRY_BUDGET: '2' });
   await until(() => /giving up/.test(r.log()), 'the budget to end');
   const lines = attemptLines(r.log());
   assert.match(lines[0], /does not know its tenant yet/);
@@ -295,7 +295,7 @@ test('the cause of each attempt comes from that attempt only: tenant, then not f
 
 test("an attempt whose own output names no cause reports the default, not an earlier attempt's cause", async () => {
   const w = setup({ gitScript: ['auth', 'silent'] });
-  const r = await run(w, { LIIVO_CLONE_RETRY_BUDGET: '1' });
+  const r = await run(w, { LIIVO_CLONE_RETRY_BUDGET: '2' });
   await until(() => /giving up/.test(r.log()), 'the budget to end');
   const lines = attemptLines(r.log());
   assert.match(lines[0], /authentication failed/);
