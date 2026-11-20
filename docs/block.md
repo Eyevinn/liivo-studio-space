@@ -334,12 +334,13 @@ unchanged one. Nothing is generated into the repository.
   `starting`, `running`, `failed` or `none`. A SIGTERM (a bridge restart) writes nothing.
   The entrypoint removes a leftover state file at start.
 - **Page.** While installing or starting, the 502 page is a centered waiting page with a
-  CSS-only spinner and the heading "Almost ready" (no state text is shown), the chat tag, and
-  a reload every 4 s. The 502 "Preview not running" page for failed (with the reason and the
-  log path), nothing to start and no state keeps its title, heading and chat tag with a
-  status line. The state
+  CSS-only spinner and the heading "Almost ready", the chat tag, and a reload every 4 s.
+  Nothing from the state file is rendered on the waiting page. When the state is failed or
+  none, the "Preview not running" page keeps its title, heading and chat tag and gets one
+  status line (for failed the reason and the log path). With no state, an untrusted state
+  file, a running state or a repository's own start.sh, the page is unchanged. The state
   file is untrusted input: a regular file below 2 KiB, a known state, an escaped and
-  capped reason, no log content; anything else gives the page as it was.
+  capped reason, no log content.
 - **Refresh restart.** The entrypoint passes `LIIVO_DEFAULT_START` (the installed path)
   to the bridge. Until the bridge in Eyevinn/liivo-studio uses it, a refresh does not
   restart a default-started dev server (Next.js and Vite hot-reload), and a lockfile
