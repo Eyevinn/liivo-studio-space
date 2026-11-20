@@ -194,6 +194,18 @@ test('the bridge runs with env -i and the minimal list: the Claude credential an
   assert.strictEqual(read(path.join(w.out, 'bridge-argv')).trim(), path.join(w.home, '.liivo', 'bridge', 'current', 'package', 'server.mjs'));
 });
 
+test('LIIVO_GIT_HOST carries the exact managed-Gitea host to the bridge, and only for that host', async () => {
+  const host = 'acme-acmegit.go-gitea-gitea.auto.dev.osaas.io';
+  const w = setup();
+  await run(w, { REPO_URL: `https://${host.toUpperCase()}/acme/site.git` });
+  const env = envOf(await until(bridgeEnvFile(w), 'the bridge to start'));
+  assert.strictEqual(env.LIIVO_GIT_HOST, host);
+  const w2 = setup();
+  await run(w2, { REPO_URL: 'https://github.com/Eyevinn/x.git' });
+  const env2 = envOf(await until(bridgeEnvFile(w2), 'the bridge to start'));
+  assert.ok(!('LIIVO_GIT_HOST' in env2));
+});
+
 test('with the API key as the credential it is passed, and the OAuth token is not', async () => {
   const w = setup();
   await run(w, { ANTHROPIC_API_KEY: 'api-secret-2', CLAUDE_CODE_OAUTH_TOKEN: 'unset' });
