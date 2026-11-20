@@ -479,6 +479,46 @@ gateway image carries it as one tarball whose version is the gateway's build.
   credential for its socket). The same uid in the workspace can still reach the bridge's
   loopback port and its files.
 
+## Project parameter store values (`liivo-env`)
+
+`/usr/local/bin/liivo-env <command> [args]` runs the command with the values of the project's parameter store
+added to its environment, on top of the environment it was called with, and replaces itself with the command
+(`exec`: same pid, so the bridge's pid-file restart contract holds; the exit status is the command's). The
+entrypoint runs `.liivo/setup.sh`, `.liivo/start.sh` and the default start through it, after the agent
+variables and the Claude pair are unset. It is a no-op when the project has no store.
+
+- **Flow.** `forwarder/liivo-env.js` asks the signer (`POST /env-token` on `~/.liivo/sign.sock`, audience `env`,
+  60 s like `git`) for a token and calls `GET {LIIVO_GATEWAY_URL}/api/project-env` with it. 200 `{ "bound": false }`
+  means no store; 200 `{ "bound": true, "store", "values", "skipped" }` carries the values; any other status with a
+  `reason` means start without values. `auth.js` `AUDIENCES` is not widened: the forwarder refuses an `env` token,
+  only the gateway verifies it.
+- **No parsing by a shell.** The helper prints NUL-separated `NAME=value` records and the wrapper exports each
+  with `export -- "$record"`. No value reaches `eval`, `source` or a shell for parsing.
+- **Names and limits.** A name must match `^[A-Za-z_][A-Za-z0-9_]*$` and must not be reserved (the list is in
+  `forwarder/liivo-env.js`, compared case-insensitively; `NODE_ENV`, `NODE_NO_WARNINGS`, `LANG`, `LC_*`, `TERM`, `TZ`,
+  `DEBUG`, `CI`, `UV_THREADPOOL_SIZE` and `UV_USE_IO_URING` stay allowed). A value with a NUL, a value over 32 KiB,
+  more than 100 names or more than 128 KiB in total is skipped by name with a reason. The command keeps the value
+  it was called with for a reserved name. These limits are the single source of truth; the gateway is never stricter.
+- **Fail soft.** Gateway unreachable, a non-200, a malformed body, `bound: false`, a rate refusal (its reason is
+  recorded), no `LIIVO_GATEWAY_URL` or no signer: the command runs with the environment it was called with. The
+  gateway request is bounded by `LIIVO_ENV_TIMEOUT` (10 s). While the signer answers 409 (no handoff or status call
+  has reached the workspace yet) the helper polls every 2 s up to `LIIVO_ENV_TENANT_WAIT` seconds (300), then runs the
+  command without values and records `tenant_unknown`. A missing signer socket is waited out for
+  `LIIVO_ENV_SIGNER_WAIT` seconds (15), then `no_signer`. When setup.sh's load ended with `tenant_unknown` the
+  entrypoint does not write the setup marker, so setup.sh runs again, with values, on the next start.
+- **Status.** Each run writes `/tmp/liivo-env.state` (mode 0600, JSON `{time, store, loaded, skipped, error}`),
+  names and reasons only, never a value, and nothing else to disk. The entrypoint removes a leftover file at start.
+  The only output is one line on stderr with the store name and counts (nothing when the project has no store).
+  Nothing is written into `$PROJECT_DIR`.
+- **Residuals.** Every process in the workspace can read the values (same uid). Under Q3 a value printed by a command
+  Claude runs (`liivo-env <cmd>`, `liivo-env env`) reaches Claude's context, the model provider and Claude Code's
+  session transcript under `~/.claude` in the workspace (`claude` runs with `--resume`, `bridge/claude.mjs` 66); the
+  bridge's redaction covers only browser-bound text and the chat history file. A store writer controls every
+  non-reserved name. A value shorter than 8 characters is neither redacted nor caught by the commit guard. A tool not
+  on the reserved list that reads its configuration, a wrapper command or a download mirror from the environment can
+  still be steered by a store writer. Project output redirected to `~/liivo-run.log` and `/tmp/liivo-start-<dir>.log`
+  can hold any value the project prints.
+
 ## Security notes
 
 - The entrypoint removes `CODER_AGENT_TOKEN`, `CODER_AGENT_URL` and

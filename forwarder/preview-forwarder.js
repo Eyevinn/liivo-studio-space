@@ -644,6 +644,9 @@ function createForwarder({
     let audience = null;
     if (req.method === 'POST' && req.url === '/git-token') audience = ['git', 60];
     if (req.method === 'POST' && req.url === '/bridge-token') audience = ['bridge', BRIDGE_TOKEN_SECONDS];
+    // /env-token: liivo-env (audience env, 60 s like git), which loads the project's parameter store values.
+    // auth.js AUDIENCES is not widened: an env token is verified by the gateway only, never by this forwarder.
+    if (req.method === 'POST' && req.url === '/env-token') audience = ['env', 60];
     if (!audience) return refuse(404, 'not found');
     if (!handoffKey) return refuse(503, 'HANDOFF_KEY is not set');
     if (!gatewayUrl) return refuse(503, 'LIIVO_GATEWAY_URL is not set');

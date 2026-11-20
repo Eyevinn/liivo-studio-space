@@ -437,6 +437,11 @@ fi
 # without sudo and cannot drop to another uid. The token only grants access to
 # this one workspace's agent endpoints, and the hooks are the workspace owner's
 # own repo code.
+# The hooks start through liivo-env, which adds the project's parameter store values (docs/block.md). Without
+# the wrapper on PATH they start as before.
+LIIVO_ENV_STATE="${LIIVO_ENV_STATE_FILE:-/tmp/liivo-env.state}"
+env_wrap=()
+if command -v liivo-env >/dev/null 2>&1; then env_wrap=(liivo-env); fi
 run_hooks() {
   cd "$PROJECT_DIR" || exit 0
   if command -v mise >/dev/null 2>&1; then
@@ -445,8 +450,13 @@ run_hooks() {
   fi
   if [ -f .liivo/setup.sh ] && [ ! -f "$HOME/.liivo/setup.done" ]; then
     echo "running .liivo/setup.sh"
-    if bash .liivo/setup.sh; then
-      touch "$HOME/.liivo/setup.done"
+    if ${env_wrap[@]+"${env_wrap[@]}"} bash .liivo/setup.sh; then
+      # A load that ended with tenant_unknown ran setup.sh without its values: it runs again on the next start.
+      if grep -q '"error":"tenant_unknown"' "$LIIVO_ENV_STATE" 2>/dev/null; then
+        echo "setup.sh ran without the project's values (tenant not known yet), it runs again on the next start"
+      else
+        touch "$HOME/.liivo/setup.done"
+      fi
     else
       echo "setup.sh failed, it runs again on the next start"
     fi
@@ -459,10 +469,10 @@ run_hooks() {
     start_pid_file="/tmp/liivo-start-$(basename "$PROJECT_DIR").pid"
     # shellcheck disable=SC2016 # $$ and $1 are for the inner bash, not this one
     if command -v setsid >/dev/null 2>&1; then
-      setsid --wait bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "$start_pid_file" bash .liivo/start.sh \
+      setsid --wait bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "$start_pid_file" ${env_wrap[@]+"${env_wrap[@]}"} bash .liivo/start.sh \
         || echo "start.sh exited with an error"
     else
-      bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "$start_pid_file" bash .liivo/start.sh \
+      bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "$start_pid_file" ${env_wrap[@]+"${env_wrap[@]}"} bash .liivo/start.sh \
         || echo "start.sh exited with an error"
     fi
   elif [ -f "$DEFAULT_START" ]; then
@@ -473,10 +483,10 @@ run_hooks() {
     echo "running the default start, output in /tmp/$start_name.log"
     # shellcheck disable=SC2016 # $$ and $1 are for the inner bash, not this one
     if command -v setsid >/dev/null 2>&1; then
-      setsid --wait bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "/tmp/$start_name.pid" node "$DEFAULT_START" \
+      setsid --wait bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "/tmp/$start_name.pid" ${env_wrap[@]+"${env_wrap[@]}"} node "$DEFAULT_START" \
         >> "/tmp/$start_name.log" 2>&1 || echo "the default start ended with an error"
     else
-      bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "/tmp/$start_name.pid" node "$DEFAULT_START" \
+      bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "/tmp/$start_name.pid" ${env_wrap[@]+"${env_wrap[@]}"} node "$DEFAULT_START" \
         >> "/tmp/$start_name.log" 2>&1 || echo "the default start ended with an error"
     fi
   fi
@@ -492,7 +502,7 @@ start_hooks() {
   ) < /dev/null > "$HOME/liivo-run.log" 2>&1
 }
 # A state left in /tmp by an earlier run of the default start is never shown.
-rm -f "/tmp/liivo-start-$(basename "$PROJECT_DIR").state"
+rm -f "/tmp/liivo-start-$(basename "$PROJECT_DIR").state" "$LIIVO_ENV_STATE"
 if [ -n "$clone_retry" ]; then
   # The first clone failed: the hooks wait for the retries (until the clone works or the budget is
   # spent), so a hook never runs against an empty directory. The agent below does not wait.
