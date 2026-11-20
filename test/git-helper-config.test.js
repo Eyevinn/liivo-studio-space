@@ -10,6 +10,16 @@ const { spawnSync, execFileSync } = require('node:child_process');
 const ENTRYPOINT = path.join(__dirname, '..', 'osc-entrypoint.sh');
 const HOST = 'acme-acmegit.go-gitea-gitea.auto.dev.osaas.io';
 const LIB = '/opt/test-lib';
+const REAL_GIT = execFileSync('sh', ['-c', 'command -v git']).toString().trim();
+// a git whose clone only creates the checkout, so no test depends on the network
+const GIT_STUB = `#!/bin/bash
+if [ "$1" = clone ]; then
+  for a in "$@"; do d="$a"; done
+  mkdir -p "$d/.git" && : > "$d/.git/HEAD"
+  exit 0
+fi
+exec ${REAL_GIT} "$@"
+`;
 
 function setup() {
   const dir = fs.mkdtempSync(path.join('/tmp', 'lsgh-'));
@@ -18,7 +28,7 @@ function setup() {
   fs.mkdirSync(bin);
   fs.mkdirSync(home);
   fs.writeFileSync(path.join(bin, 'coder'), '#!/bin/bash\nexit 0\n', { mode: 0o755 });
-  // git stub that clones nothing: the clone is not what these tests are about
+  fs.writeFileSync(path.join(bin, 'git'), GIT_STUB, { mode: 0o755 });
   return { dir, bin, home };
 }
 
@@ -89,7 +99,7 @@ for (const [name, url] of NO_ENTRY) {
     withHome((w) => {
       const extra = url === undefined ? {} : { REPO_URL: url };
       const r = start(w, extra);
-      assert.ok(r.status === 0 || r.status === null || r.status > 0);
+      assert.strictEqual(r.status, 0, r.log);
       assert.deepStrictEqual(entries(w), []);
     }));
 }
@@ -115,19 +125,12 @@ test('an entry left by an earlier start for a different host is gone, other cred
 
 test('a failing config write logs one WARNING and the entrypoint still starts the agent', () =>
   withHome((w) => {
-    // a read-only .gitconfig makes `git config --global` fail
-    fs.writeFileSync(path.join(w.home, '.gitconfig'), '[user]\n\temail = a@b.test\n');
-    fs.chmodSync(path.join(w.home, '.gitconfig'), 0o400);
-    fs.chmodSync(w.home, 0o500);
-    try {
-      const r = start(w, { REPO_URL: `https://${HOST}/acme/site.git` });
-      const warnings = r.log.split('\n').filter((l) => /WARNING: could not configure the git credential helper/.test(l));
-      if (process.getuid && process.getuid() === 0) return; // root ignores the modes
-      assert.strictEqual(warnings.length, 1, r.log);
-      assert.strictEqual(r.status, 0, r.log);
-    } finally {
-      fs.chmodSync(w.home, 0o700);
-    }
+    // a directory in place of ~/.gitconfig makes `git config --global` fail on write
+    fs.mkdirSync(path.join(w.home, '.gitconfig'));
+    const r = start(w, { REPO_URL: `https://${HOST}/acme/site.git` });
+    const warnings = r.log.split('\n').filter((l) => /WARNING: could not configure the git credential helper/.test(l));
+    assert.strictEqual(warnings.length, 1, r.log);
+    assert.strictEqual(r.status, 0, r.log);
   }));
 
 test('the helper entry runs the helper script with the host as an argument', () =>

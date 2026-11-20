@@ -11,6 +11,16 @@ const { spawn, spawnSync, execFileSync } = require('node:child_process');
 
 const ENTRYPOINT = path.join(__dirname, '..', 'osc-entrypoint.sh');
 const KEY = crypto.randomBytes(32).toString('base64');
+const REAL_GIT = execFileSync('sh', ['-c', 'command -v git']).toString().trim();
+// a git whose clone only creates the checkout, so no test depends on the network
+const GIT_STUB = `#!/bin/bash
+if [ "$1" = clone ]; then
+  for a in "$@"; do d="$a"; done
+  mkdir -p "$d/.git" && : > "$d/.git/HEAD"
+  exit 0
+fi
+exec ${REAL_GIT} "$@"
+`;
 const cleanups = [];
 afterEach(() => {
   while (cleanups.length) {
@@ -197,10 +207,12 @@ test('the bridge runs with env -i and the minimal list: the Claude credential an
 test('LIIVO_GIT_HOST carries the exact managed-Gitea host to the bridge, and only for that host', async () => {
   const host = 'acme-acmegit.go-gitea-gitea.auto.dev.osaas.io';
   const w = setup();
+  fs.writeFileSync(path.join(w.bin, 'git'), GIT_STUB, { mode: 0o755 });
   await run(w, { REPO_URL: `https://${host.toUpperCase()}/acme/site.git` });
   const env = envOf(await until(bridgeEnvFile(w), 'the bridge to start'));
   assert.strictEqual(env.LIIVO_GIT_HOST, host);
   const w2 = setup();
+  fs.writeFileSync(path.join(w2.bin, 'git'), GIT_STUB, { mode: 0o755 });
   await run(w2, { REPO_URL: 'https://github.com/Eyevinn/x.git' });
   const env2 = envOf(await until(bridgeEnvFile(w2), 'the bridge to start'));
   assert.ok(!('LIIVO_GIT_HOST' in env2));
