@@ -333,9 +333,11 @@ unchanged one. Nothing is generated into the repository.
   `/tmp/liivo-start-<dir>.state` is JSON `{"state","reason"}` with state `installing`,
   `starting`, `running`, `failed` or `none`. A SIGTERM (a bridge restart) writes nothing.
   The entrypoint removes a leftover state file at start.
-- **Page.** The 502 "Preview not running" page keeps its title, heading and chat tag and
-  adds a status line (installing, starting, failed with the reason and the log path,
-  nothing to start), and reloads itself every 4 s while installing or starting. The state
+- **Page.** While installing or starting, the 502 page is a centered waiting page with a
+  CSS-only spinner and the heading "Almost ready" (no state text is shown), the chat tag, and
+  a reload every 4 s. The 502 "Preview not running" page for failed (with the reason and the
+  log path), nothing to start and no state keeps its title, heading and chat tag with a
+  status line. The state
   file is untrusted input: a regular file below 2 KiB, a known state, an escaped and
   capped reason, no log content; anything else gives the page as it was.
 - **Refresh restart.** The entrypoint passes `LIIVO_DEFAULT_START` (the installed path)
