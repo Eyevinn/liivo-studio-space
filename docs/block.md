@@ -206,7 +206,9 @@ bearer: 401. If git itself fails: 500, never "clean".
 
 **Git credential helper.** The image sets
 `credential.https://github.com.helper` (system config) to
-`forwarder/git-credential-liivo.js`. For `https://github.com` it asks the
+`forwarder/git-credential-liivo.js`. The entrypoint adds the same helper for the
+project's managed-Gitea host (see "Managed-Gitea host" below). For `https://github.com`
+and that host it asks the
 forwarder, over a unix socket (`$HOME/.liivo/sign.sock`, mode 0600, so the key
 never leaves the forwarder), for an `aud` `git` token (60 s, `tenant`, `user`,
 `instance` as last learned from a verified handoff or status token and kept in
@@ -220,6 +222,23 @@ environment variable. The tenant is learned from the first handoff or status
 call, which reaches a new instance a moment after the entrypoint's first clone, so
 a private repository fails that first attempt. The entrypoint therefore retries
 the clone in the background (see "First clone and retry" below).
+
+### Managed-Gitea host
+
+When `REPO_URL` is `https://<tenant>-<tenant>git.go-gitea-gitea.auto.<env>.osaas.io/...`
+(https, no user name or password, no port, the tenant part repeated, compared in lower
+case), the entrypoint writes
+`git config --global credential.https://<host>.helper '!node <lib>/git-credential-liivo.js --host=<host>'`
+before the first clone, and passes the host to the bridge as `LIIVO_GIT_HOST`. The
+helper answers exactly like for `github.com` (user name `x-access-token`), for that
+host only: the `host` attribute is compared exactly and case-insensitively, so
+another managed-Gitea host, an unrelated host, a port or a suffix gets no output and
+no gateway call. The entry is rewritten at every start (one entry after any number of
+starts) and an entry for another host left by an earlier start is removed. Any other
+`REPO_URL` writes no entry and the bridge gets no `LIIVO_GIT_HOST`, so a public
+repository on any other host clones unauthenticated. If the config write fails the
+entrypoint logs one `WARNING` and goes on; the clone then runs unauthenticated. Until
+the gateway answers for a Gitea project (404), git goes on unauthenticated.
 
 ### First clone and retry
 
