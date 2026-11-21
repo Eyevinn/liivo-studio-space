@@ -402,7 +402,7 @@ gateway image carries it as one tarball whose version is the gateway's build.
   `/__liivo/health` and reloads once when the bridge answers, and after five minutes
   says that the preview works without the chat), `/__liivo/health` answers 503
   `{"bridge":"starting"}` and every other bridge path 503. The preview itself is
-  never affected. A bridge that exits is restarted after 1 to 30 s.
+  never affected. A bridge that exits after running 60 s or longer is restarted from the cached copy after 1 to 30 s (doubling). A bridge that exits within 60 s of starting is not restarted from the cache: after the same wait the supervisor fetches the current bridge again (one more gateway request per quick exit, at the 1 to 30 s cadence), so a bad cached version is replaced.
 - **Supervisor.** The clone, the hooks and `exec coder agent` never wait for it. The
   fetcher runs under `env -i` with `PATH`, `HOME` and `LANG` only. The
   bridge runs under `env -i` with `PATH`, `HOME`, `LANG`, `LIIVO_REPO_DIR`,
@@ -428,7 +428,7 @@ gateway image carries it as one tarball whose version is the gateway's build.
     changes nothing (no file, no signal, no fetch). 2xx means "recorded", not "the supervisor
     is alive"; the gateway (Eyevinn/liivo-studio#48) reads the status class only.
   - No answer from the bridge at all (refused, timeout) follows `state.json`: `starting`
-    (the bridge exited, the supervisor will restart the cached one) is honoured, `running` (a
+    (the bridge exited, the supervisor will restart the cached one after a run of 60 s or more, or fetch the current one after a quick exit) is honoured, `running` (a
     live process that does not answer may be mid-turn) and `unavailable` are refused with
     reason `unknown`.
   - The supervisor polls once a second while the bridge runs. With a request present it reads

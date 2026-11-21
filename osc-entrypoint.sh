@@ -208,7 +208,7 @@ reload_expired() {
   [ $(($(date +%s) - mtime)) -gt "$RELOAD_MAX_AGE" ]
 }
 supervise_bridge() {
-  local gw_delay=5 run_delay=1 rc version started bpid reloaded
+  local gw_delay=5 run_delay=1 rc version started bpid reloaded ran quick
   local -a bridge_env
   # A fifo nothing writes to: `read -t 1` on it is a one second wait that is not a `sleep` call.
   mkfifo "$BRIDGE_DIR/.tick" && exec 9<> "$BRIDGE_DIR/.tick" && rm -f "$BRIDGE_DIR/.tick"
@@ -271,11 +271,19 @@ supervise_bridge() {
         log "bridge stopped for a reload ($rc), fetching the current bridge"
         break
       fi
-      [ $(($(date +%s) - started)) -lt 60 ] || run_delay=1
-      log "bridge exited ($rc), restarting in ${run_delay}s"
+      ran=$(($(date +%s) - started))
+      if [ "$ran" -lt 60 ]; then
+        quick=1
+        log "bridge exited ($rc) within ${ran}s, fetching the current bridge"
+      else
+        quick=""
+        run_delay=1
+        log "bridge exited ($rc), restarting in ${run_delay}s"
+      fi
       sleep "$run_delay"
       run_delay=$((run_delay * 2))
       [ "$run_delay" -le 30 ] || run_delay=30
+      [ -z "$quick" ] || break
       if [ -e "$RELOAD_REQUEST" ]; then
         rm -f "$RELOAD_REQUEST"
         log "bridge reload requested while the bridge was down, fetching the current bridge"
