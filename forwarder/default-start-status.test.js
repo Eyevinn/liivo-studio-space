@@ -48,13 +48,40 @@ async function page(w, { withForwarder = true } = {}) {
 
 const PLAIN = /<title>Preview not running<\/title>.*<h1>Preview not running<\/h1><p>The project's preview is not running\.<\/p>/s;
 
-test('no state file: the page is the one from before, with no status and no reload', async () => {
+const REFRESH = '<meta http-equiv="refresh" content="4">';
+
+test('no state file: the plain page reloads itself every 4 s', async () => {
   const w = setup();
   const r = await page(w);
   assert.strictEqual(r.status, 502);
   assert.match(r.body, PLAIN);
-  assert.ok(!/refresh/.test(r.body));
-  assert.ok(r.body.startsWith('<!doctype html><html><head><meta charset="utf-8"><title>Preview not running</title></head>'));
+  assert.ok(r.body.startsWith(`<!doctype html><html><head><meta charset="utf-8">${REFRESH}<title>Preview not running</title></head>`));
+});
+
+test('state running with the preview not answering: the plain page reloads itself', async () => {
+  const w = setup();
+  w.set({ state: 'running' });
+  const r = await page(w);
+  assert.strictEqual(r.status, 502);
+  assert.match(r.body, PLAIN);
+  assert.ok(r.body.includes(REFRESH));
+});
+
+test('a state file that is not trusted: the plain page reloads itself', async () => {
+  const w = setup();
+  w.set('{not json');
+  const r = await page(w);
+  assert.match(r.body, PLAIN);
+  assert.ok(r.body.includes(REFRESH));
+});
+
+test("a repository's own start.sh with no state file: the plain page reloads itself", async () => {
+  const w = setup();
+  fs.mkdirSync(path.join(w.project, '.liivo'));
+  fs.writeFileSync(path.join(w.project, '.liivo', 'start.sh'), '#!/bin/sh\n');
+  const r = await page(w);
+  assert.match(r.body, PLAIN);
+  assert.ok(r.body.includes(REFRESH));
 });
 
 for (const [state, reason, text, reloads] of [
