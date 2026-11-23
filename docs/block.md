@@ -337,8 +337,12 @@ unchanged one. Nothing is generated into the repository.
   CSS-only spinner and the heading "Almost ready", the chat tag, and a reload every 4 s.
   Nothing from the state file is rendered on the waiting page. When the state is failed or
   none, the "Preview not running" page keeps its title, heading and chat tag and gets one
-  status line (for failed the reason and the log path). With no state, an untrusted state
-  file, a running state or a repository's own start.sh, the page is unchanged. The state
+  status line (for failed the reason and the log path) and does not reload. In every
+  other case (no state yet, an untrusted state file, a running state whose server does not
+  answer yet, a repository's own start.sh) the "Preview not running" page reloads itself
+  every 4 s until the preview answers; only the terminal states failed and none stop the
+  reload. The refresh is part of the forwarder's own page and is never added to a response
+  of the app. The state
   file is untrusted input: a regular file below 2 KiB, a known state, an escaped and
   capped reason, no log content.
 - **Refresh restart.** The entrypoint passes `LIIVO_DEFAULT_START` (the installed path)

@@ -4,7 +4,7 @@
 // The state file is written by project-writable code, so it is untrusted input: only a regular file (no
 // symlink) below a small size cap is read, only the five known states are accepted, the reason is
 // control-character-stripped, length-capped and HTML-escaped, and no log content is ever rendered.
-// Anything else gives null, which is the page as it was before the default start existed.
+// Anything else gives null: the plain page, with no status line, which reloads itself like every page that is not terminal.
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -27,7 +27,7 @@ function isFile(p) {
 // -> { html, refresh } or { waiting: true, refresh: true } (installing, starting) or null.
 function defaultStartStatus(projectDir, stateDir = '/tmp') {
   if (!projectDir) return null;
-  // A repository's own start.sh always wins: its page is the unchanged one.
+  // A repository's own start.sh always wins: no status line (the page still reloads itself).
   if (isFile(path.join(projectDir, '.liivo', 'start.sh'))) return null;
   const name = path.basename(projectDir);
   const file = path.join(stateDir, `liivo-start-${name}.state`);
@@ -62,7 +62,7 @@ function defaultStartStatus(projectDir, stateDir = '/tmp') {
         refresh: false,
       };
     default:
-      return null; // running: the dev server is up or about to answer, nothing to add
+      return null; // running: the dev server is up or about to answer, nothing to add (the page reloads until it does)
   }
 }
 

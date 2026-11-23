@@ -137,6 +137,53 @@ test('answers 502 with the not-running page when nothing listens, and keeps serv
     assert.strictEqual(res.status, 502);
     assert.match(res.headers['content-type'], /text\/html/);
     assert.match(res.body, /preview is not running/);
+    assert.ok(res.body.includes('<meta http-equiv="refresh" content="4">'));
+  }
+});
+
+test('once the preview answers, the response is the app own and carries no refresh; an app 502/503 passes through unchanged', async () => {
+  const tmp = net.createServer();
+  const port = await listen(tmp);
+  await new Promise((r) => tmp.close(r));
+  const f = createForwarder({ previewPort: port, handoffKey: KEY });
+  const fPort = await listen(f);
+  const before = await request(fPort, { path: '/' });
+  assert.strictEqual(before.status, 502);
+  assert.ok(before.body.includes('http-equiv="refresh"'));
+
+  const app = http.createServer((req, res) => {
+    if (req.url === '/own502') {
+      res.writeHead(502, { 'Content-Type': 'text/html' });
+      res.end('<html><body>app bad gateway</body></html>');
+    } else if (req.url === '/own503') {
+      res.writeHead(503, { 'Content-Type': 'text/plain' });
+      res.end('app unavailable');
+    } else {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html><head></head><body>hello app</body></html>');
+    }
+  });
+  await new Promise((r) => app.listen(port, '127.0.0.1', r));
+  app.on('connection', (c) => {
+    sockets.add(c);
+    c.on('close', () => sockets.delete(c));
+  });
+  try {
+    const ok = await request(fPort, { path: '/' });
+    assert.strictEqual(ok.status, 200);
+    assert.match(ok.body, /hello app/);
+    assert.ok(!/http-equiv="refresh"/.test(ok.body));
+    const a = await request(fPort, { path: '/own502' });
+    assert.strictEqual(a.status, 502);
+    assert.match(a.body, /app bad gateway/);
+    assert.ok(!/http-equiv="refresh"/.test(a.body));
+    const b = await request(fPort, { path: '/own503' });
+    assert.strictEqual(b.status, 503);
+    assert.strictEqual(b.body, 'app unavailable');
+  } finally {
+    for (const c of sockets) c.destroy();
+    app.close();
+    f.close();
   }
 });
 

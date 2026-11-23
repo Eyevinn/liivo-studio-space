@@ -68,11 +68,12 @@ function pageWaiting() {
   );
 }
 
-// The page for a preview that does not answer. With a status of the default start (default-start.js) it adds one
-// status line and, while the default start is installing or starting, reloads itself.
+// The page for a preview that does not answer. It reloads itself every 4 s, so it comes up without a manual reload,
+// except when the status of the default start (default-start.js) is terminal (refresh: false: failed, none). With
+// such a status it adds one status line. This page is only ever the forwarder's own answer, never a response of the app.
 function page502(status = null) {
   if (status && status.waiting) return pageWaiting();
-  const refresh = status && status.refresh ? '<meta http-equiv="refresh" content="4">' : '';
+  const refresh = status && status.refresh === false ? '' : '<meta http-equiv="refresh" content="4">';
   return (
     `<!doctype html><html><head><meta charset="utf-8">${refresh}<title>Preview not running</title></head>` +
     `<body><h1>Preview not running</h1><p>The project's preview is not running.</p>${status ? status.html : ''}${inject.tagFor('')}</body></html>\n`
